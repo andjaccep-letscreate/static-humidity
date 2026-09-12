@@ -1,0 +1,1417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metaling Through Time — Binary Connection</title>
+<style>
+  :root { color-scheme: dark; }
+  html { background: #101214; }
+  body {
+    margin: 0 auto; max-width: 720px; padding: 20px 16px 48px;
+    font: 18px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: #e8e8e8; background: #101214; word-break: break-word;
+  }
+  h1 { font-size: 26px; margin: 0 0 8px; }
+  h2 { font-size: 20px; margin: 24px 0 8px; color: #cfd3d8; }
+  p { margin: 8px 0; }
+  a { color: #8ab4f8; }
+  .summary { font-size: 28px; font-weight: 700; margin: 12px 0 20px; }
+  .summary.pass { color: #4ade80; }
+  .summary.fail { color: #f87171; }
+  ul.cases { list-style: none; margin: 0; padding: 0; }
+  ul.cases li { padding: 10px 0; border-bottom: 1px solid #2a2e33; font-size: 20px; }
+  .tag { display: inline-block; min-width: 4.2em; font-weight: 800; letter-spacing: .04em; }
+  .tag.pass { color: #4ade80; }
+  .tag.fail { color: #f87171; }
+  .num { color: #9aa0a6; margin-right: .5em; }
+  .detail { display: block; margin-top: 6px; font-size: 15px; line-height: 1.4; color: #f3c4c4; white-space: pre-wrap; }
+  .lines p { margin: 6px 0; }
+  .lines .k { color: #9aa0a6; }
+  .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; word-break: break-all; }
+  .muted { color: #9aa0a6; font-size: 15px; }
+</style>
+</head>
+<body>
+<main id="app"><p class="muted">Loading…</p></main>
+
+<script id="engine">
+'use strict';
+/* ==========================================================================
+   METALING THROUGH TIME — BINARY CONNECTION
+   Save engine, schema version 2. Implements BINARY-CONNECTION-SPEC.md
+   (registry frozen, audited 2026-09-10).
+
+   Vanilla JavaScript. No libraries, no external assets, no build step.
+   Deterministic: the same state always produces the same code.
+
+   The code string is the source of truth. localStorage is a convenience
+   cache that stores the code string itself and nothing else.
+   ========================================================================== */
+
+const SCHEMA_VERSION = 2;
+const SERIES_PREFIX = 'MTT';
+const MAX_CODE_LENGTH = 512;   // a code of 512 characters or more is rejected before decode
+
+/* --------------------------------------------------------------------------
+   1. THE REGISTRY (Spec Section 3) — the spine of the format.
+
+   APPEND-ONLY. Array index == registry bit position.
+
+   Never reorder, renumber, reuse, or delete a row. Every existing player
+   code stores its facts by bit position, so reordering or renumbering this
+   table breaks every existing player code. New items take the next free bit
+   inside their reserved range. A retired bit stays burned forever. Ranges
+   are reserved per game so two games in development cannot collide.
+
+   Filling a <tbd> placeholder inside an already-reserved range is an
+   append, not a schema change. Naming it changes the ID string only.
+
+   Rows: { id, kind, who, requires?, variantOf? }
+     kind: crew | recruit | accessory | weapon | ability
+     who:  the character the row belongs to
+   Empty reserved slots are null. Bits 4 and 5 are RETIRED and never assigned.
+   -------------------------------------------------------------------------- */
+const RETIRED = Object.freeze({ id: null, kind: 'retired' });   // bits 4–5: burned, never assign
+const reserved = (n) => new Array(n).fill(null);                // present, empty, awaiting append
+
+const REGISTRY = Object.freeze([
+  /*   0 */ { id: 'crew.gold',     kind: 'crew', who: 'gold' },
+  /*   1 */ { id: 'crew.silver',   kind: 'crew', who: 'silver' },
+  /*   2 */ { id: 'crew.titanium', kind: 'crew', who: 'titanium' },
+  /*   3 */ { id: 'crew.platinum', kind: 'crew', who: 'platinum' },
+  /*   4 */ RETIRED,   // was vol1.cleared in an earlier draft — retired, never reuse
+  /*   5 */ RETIRED,   // was vol2.cleared in an earlier draft — retired, never reuse
+  /*   6 */ { id: 'vol2.rec.chemist', kind: 'recruit', who: 'chemist' },   // playable from vol3
+  /* 7–15   one recruit per game, vol3 onward */ ...reserved(9),
+  /* 16–31  RESERVED — vol1 gear and abilities, assigned when vol1 is remade */ ...reserved(16),
+  /*  32 */ { id: 'vol2.acc.titanium.chip',    kind: 'accessory', who: 'titanium', requires: 'titanium.drone' },
+  /*  33 */ { id: 'vol2.acc.silver.cleat',     kind: 'accessory', who: 'silver' },
+  /*  34 */ { id: 'vol2.acc.platinum.glasses', kind: 'accessory', who: 'platinum' },
+  /*  35 */ { id: 'vol2.acc.gold.<tbd>',       kind: 'accessory', who: 'gold' },
+  /*  36 */ { id: 'vol2.acc.gold.<tbd>.mod',   kind: 'accessory', who: 'gold', variantOf: 35 },   // modified variant, separate ID
+  /* 37–39  vol2 gear, free */ ...reserved(3),
+  /*  40 */ { id: 'vol2.wpn.gold.<tbd>',     kind: 'weapon', who: 'gold' },
+  /*  41 */ { id: 'vol2.wpn.silver.<tbd>',   kind: 'weapon', who: 'silver' },
+  /*  42 */ { id: 'vol2.wpn.titanium.<tbd>', kind: 'weapon', who: 'titanium' },
+  /*  43 */ { id: 'vol2.wpn.platinum.<tbd>', kind: 'weapon', who: 'platinum' },
+  /* 44–63  vol2 gear, free */ ...reserved(20),
+  /*  64 */ { id: 'vol2.abl.<owner>.<tbd>', kind: 'ability', who: '<owner>' },
+  /* 65–95  vol2 abilities, free */ ...reserved(31),
+  /* 96–159  RESERVED — vol3 gear and abilities */ ...reserved(64),
+  /* 160–223 RESERVED — vol4 gear and abilities */ ...reserved(64),
+  /* 224+   allocated per game on the same pattern */
+]);
+
+/* Registry ID → bit position. Built once; the registry never changes at runtime. */
+const REGISTRY_BIT = new Map();
+REGISTRY.forEach((row, bit) => { if (row && row.id) REGISTRY_BIT.set(row.id, bit); });
+
+/* --------------------------------------------------------------------------
+   2. THE CHARACTER BIT SET — frozen. Fourteen positions.
+   Bits 4–5 are excluded and never counted. Equipped and Tier sections are
+   sized by the count of SET bits in this set, in ascending order.
+   -------------------------------------------------------------------------- */
+const CHARACTER_BITS = Object.freeze([0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+const CHARACTER_BIT_SET = new Set(CHARACTER_BITS);
+
+/* --------------------------------------------------------------------------
+   This build's roster table. "Recruited" (a set bit) is not "playable here";
+   the roster decides what this game can do with a character. A character is
+   rosterable in this build when it has a row here. Any set character bit
+   without a row is an unknown recruit and is preserved verbatim.
+
+   Bonded equipment (Spec 4.2) is a character property, not a registry row:
+   the chemist's chemistry book is her weapon, fixed and unlosable. It has
+   no bit. Her weapon slot always encodes as 0 and she still carries a tier.
+   -------------------------------------------------------------------------- */
+const ROSTER = Object.freeze({
+  gold:     Object.freeze({ bit: 0, bondedWeapon: null }),
+  silver:   Object.freeze({ bit: 1, bondedWeapon: null }),
+  titanium: Object.freeze({ bit: 2, bondedWeapon: null }),
+  platinum: Object.freeze({ bit: 3, bondedWeapon: null }),
+  chemist:  Object.freeze({ bit: 6, bondedWeapon: 'chemistry-book', playableFrom: 'vol3' }),
+});
+const CHARACTERS = Object.freeze(Object.keys(ROSTER).sort((a, b) => ROSTER[a].bit - ROSTER[b].bit));  // ascending bit order
+const ROSTER_BY_BIT = {};
+for (const name of CHARACTERS) ROSTER_BY_BIT[ROSTER[name].bit] = name;
+
+/* Capabilities this build provides for accessory dependencies (Spec 6, dependency
+   rule). This branch carries no Volume Two content, so nothing is provided:
+   dependent accessories load as owned and dormant, never dropped. */
+const PROVIDED_CAPABILITIES = new Set([]);
+
+/* --------------------------------------------------------------------------
+   3. DISPLAY TABLES — the only source of player-facing strings.
+   Internal ordinals vol1/vol2/vol3 are permanent. Public titles may change;
+   retitling edits one line here. No player-facing string is ever built by
+   concatenating a registry ID. Everything in these tables is editable at
+   any time without review.
+   -------------------------------------------------------------------------- */
+const GAME_TITLES = Object.freeze({
+  // PLACEHOLDER TITLES — taken from the repository name; edit freely.
+  vol1: 'Static',
+  vol2: 'Humidity',
+  vol3: 'Third Game (title pending)',
+});
+const KNOWN_GAMES = Object.freeze(Object.keys(GAME_TITLES));
+
+const CHARACTER_TITLES = Object.freeze({
+  gold: 'Gold', silver: 'Silver', titanium: 'Titanium', platinum: 'Platinum', chemist: 'The Chemist',
+});
+
+/* Keyed by registry ID. Every assigned registry row has an entry; the
+   harness checks this. Never derived from the ID string. */
+const ITEM_TITLES = Object.freeze({
+  'crew.gold': 'Gold',
+  'crew.silver': 'Silver',
+  'crew.titanium': 'Titanium',
+  'crew.platinum': 'Platinum',
+  'vol2.rec.chemist': 'The Chemist',
+  'vol2.acc.titanium.chip': "Titanium's chip",
+  'vol2.acc.silver.cleat': "Silver's cleat",
+  'vol2.acc.platinum.glasses': "Platinum's glasses",
+  'vol2.acc.gold.<tbd>': "Gold's accessory (name pending)",
+  'vol2.acc.gold.<tbd>.mod': "Gold's modified accessory (name pending)",
+  'vol2.wpn.gold.<tbd>': "Gold's weapon (name pending)",
+  'vol2.wpn.silver.<tbd>': "Silver's weapon (name pending)",
+  'vol2.wpn.titanium.<tbd>': "Titanium's weapon (name pending)",
+  'vol2.wpn.platinum.<tbd>': "Platinum's weapon (name pending)",
+  'vol2.abl.<owner>.<tbd>': 'Ability (owner and name pending)',
+});
+const BONDED_TITLES = Object.freeze({ 'chemistry-book': 'Chemistry book' });
+const CAPABILITY_TITLES = Object.freeze({ 'titanium.drone': "Titanium's drone kit" });
+
+/* In-world copy (Spec Section 1). Never "save code", "import", "export" or "localStorage". */
+const COPY = Object.freeze({
+  menu: 'BINARY CONNECTION',
+  retrieve: 'Bind this run to your watch.',
+  restore: 'Restore a bound run.',
+  success: 'Connection established. Crew restored.',
+  failure: 'Connection incomplete. That signal is missing pieces.',
+  bindNotice: 'The watch could not keep this run. Bind it before you leave.',
+});
+
+function titleOfCharacter(name) { return CHARACTER_TITLES[name] || 'Unnamed detective'; }
+function titleOfItem(id) {
+  if (ITEM_TITLES[id]) return ITEM_TITLES[id];
+  const bit = REGISTRY_BIT.get(id);
+  return bit === undefined ? 'Unnamed item' : 'Unnamed item (bit ' + bit + ')';
+}
+function titleOfGame(vol) {
+  if (GAME_TITLES[vol]) return GAME_TITLES[vol];
+  const n = volNumber(vol);
+  return n === null ? 'Unknown game' : 'Game ' + n + ' (not in this build)';
+}
+function volNumber(vol) {
+  const m = /^vol([1-9]\d*)$/.exec(String(vol));
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/* --------------------------------------------------------------------------
+   4. DEFAULT STATE (Spec Section 6). Built first, then overwritten with code
+   data. No field is ever undefined. Playable with no code and no storage.
+   -------------------------------------------------------------------------- */
+function defaultState() {
+  const crew = {}, equipped = {}, tier = {};
+  for (const name of CHARACTERS) {
+    crew[name] = { unlocked: name === 'gold', abilities: [] };   // Gold is always present
+    equipped[name] = { weapon: null, acc: [null, null] };        // bonded weapon slots stay null
+    tier[name] = 1;
+  }
+  const vols = {};
+  for (const vol of KNOWN_GAMES) vols[vol] = { tier: 0 };
+  return {
+    s: SCHEMA_VERSION,
+    crew,
+    gear: { owned: [], equipped, tier },
+    vols,
+    unknownBits: [],        // set registry bits this build does not recognise
+    unknownRecruits: {},    // bit → { slots: [i, i, i], tier: t }
+    extension: [],          // bytes between Endings and the checksum, verbatim
+  };
+}
+
+/* Small state mutators used by the game layer and the harness. */
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const bitOf = (idOrBit) => (typeof idOrBit === 'number' ? idOrBit : REGISTRY_BIT.get(idOrBit));
+
+function unlockCharacter(state, name) { if (ROSTER[name]) state.crew[name].unlocked = true; return state; }
+function grantGear(state, idOrBit) {
+  const bit = bitOf(idOrBit); const row = REGISTRY[bit];
+  if (!row || !row.id) return state;
+  if (row.kind === 'ability' && ROSTER[row.who]) {
+    const list = state.crew[row.who].abilities;
+    if (!list.includes(row.id)) { list.push(row.id); list.sort((a, b) => REGISTRY_BIT.get(a) - REGISTRY_BIT.get(b)); }
+    return state;
+  }
+  if (!state.gear.owned.includes(row.id)) {   // re-finding owned gear is idempotent
+    state.gear.owned.push(row.id);
+    state.gear.owned.sort((a, b) => REGISTRY_BIT.get(a) - REGISTRY_BIT.get(b));
+  }
+  return state;
+}
+function recordEnding(state, vol, tier) {   // completion is monotonic: never lowered, never cleared
+  if (volNumber(vol) === null) return state;
+  const t = clamp(tier | 0, 0, 3);
+  for (let n = 1; n <= volNumber(vol); n++) if (!state.vols['vol' + n]) state.vols['vol' + n] = { tier: 0 };   // every index up to this game exists, as after a decode
+  state.vols[vol].tier = Math.max(state.vols[vol].tier, t);
+  return state;
+}
+function isPlayable(state) {
+  try {
+    if (!state || typeof state !== 'object') return false;
+    if (!state.crew || !state.crew.gold || state.crew.gold.unlocked !== true) return false;
+    for (const name of CHARACTERS) {
+      if (typeof state.crew[name].unlocked !== 'boolean' || !Array.isArray(state.crew[name].abilities)) return false;
+      const eq = state.gear.equipped[name];
+      if (!eq || !Array.isArray(eq.acc) || eq.acc.length !== 2) return false;
+      if (!(state.gear.tier[name] >= 1 && state.gear.tier[name] <= 3)) return false;
+    }
+    if (!Array.isArray(state.gear.owned) || !Array.isArray(state.unknownBits) || !Array.isArray(state.extension)) return false;
+    if (!state.vols || !state.unknownRecruits) return false;
+    return typeof encode(state) === 'string';
+  } catch (e) { return false; }
+}
+
+/* --------------------------------------------------------------------------
+   Byte helpers: FNV-1a, base-128 varints, base64url, bitfields.
+   -------------------------------------------------------------------------- */
+function fnv1a32(bytes) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i] & 0xff; h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+function checksum24(bytes) { return fnv1a32(bytes) & 0xffffff; }   // low 24 bits
+function checksumBytes(bytes) { const c = checksum24(bytes); return [(c >>> 16) & 0xff, (c >>> 8) & 0xff, c & 0xff]; }   // written big-endian
+
+function varintEncode(value, out) {   // canonical minimal unsigned base-128
+  let v = value >>> 0;
+  while (v >= 0x80) { out.push((v & 0x7f) | 0x80); v >>>= 7; }
+  out.push(v);
+  return out;
+}
+function varintRead(bytes, pos) {     // → { value, next } or null when truncated / overlong
+  let value = 0, shift = 0, i = pos;
+  for (;;) {
+    if (i >= bytes.length || shift > 28) return null;
+    const b = bytes[i++];
+    value |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+  }
+  return { value: value >>> 0, next: i };
+}
+
+const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function base64urlEncode(bytes) {   // no padding
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = i + 1 < bytes.length ? bytes[i + 1] : 0, b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const n = (b0 << 16) | (b1 << 8) | b2;
+    out += B64URL[(n >>> 18) & 63] + B64URL[(n >>> 12) & 63];
+    if (i + 1 < bytes.length) out += B64URL[(n >>> 6) & 63];
+    if (i + 2 < bytes.length) out += B64URL[n & 63];
+  }
+  return out;
+}
+function base64urlDecode(str) {     // strict: bad characters, bad length or non-zero leftover bits → null
+  if (!/^[A-Za-z0-9_-]*$/.test(str) || str.length % 4 === 1) return null;
+  const out = [];
+  let buf = 0, bits = 0;
+  for (let i = 0; i < str.length; i++) {
+    buf = (buf << 6) | B64URL.indexOf(str[i]); bits += 6;
+    if (bits >= 8) { bits -= 8; out.push((buf >>> bits) & 0xff); buf &= (1 << bits) - 1; }
+  }
+  if (buf !== 0) return null;
+  return out;
+}
+
+function bitsToFlags(bitSet) {      // little-endian bit order, trailing zero bytes trimmed
+  const bytes = [];
+  for (const b of bitSet) {
+    const i = b >>> 3;
+    while (bytes.length <= i) bytes.push(0);
+    bytes[i] |= 1 << (b & 7);
+  }
+  while (bytes.length && bytes[bytes.length - 1] === 0) bytes.pop();
+  return bytes;
+}
+function flagsToBits(bytes) {
+  const bits = [];
+  for (let i = 0; i < bytes.length; i++) for (let k = 0; k < 8; k++) if (bytes[i] & (1 << k)) bits.push(i * 8 + k);
+  return bits;
+}
+function sealCode(version, body) {  // body = sections 1–5; appends the checksum and wraps in the envelope
+  return SERIES_PREFIX + version + '-' + base64urlEncode(body.concat(checksumBytes(body)));
+}
+
+/* --------------------------------------------------------------------------
+   5. ENCODER (Spec Section 5, rebuild rule in Section 6).
+   Re-serialises from scratch every time. Never patches bytes. Unknowns are
+   preserved as data and re-emitted at whatever their correct offset is now.
+   -------------------------------------------------------------------------- */
+function collectBits(state) {
+  const bits = new Set();
+  for (const name of CHARACTERS) if (state.crew[name].unlocked) bits.add(ROSTER[name].bit);
+  for (const id of state.gear.owned) { const b = REGISTRY_BIT.get(id); if (b !== undefined) bits.add(b); }
+  for (const name of CHARACTERS) for (const id of state.crew[name].abilities) { const b = REGISTRY_BIT.get(id); if (b !== undefined) bits.add(b); }
+  for (const b of state.unknownBits) bits.add(b | 0);                       // original positions
+  for (const key of Object.keys(state.unknownRecruits)) bits.add(key | 0); // unknown recruits are set character bits
+  return bits;
+}
+function slotIndex(id) { return id === null || id === undefined ? 0 : (REGISTRY_BIT.get(id) || 0); }
+
+function encode(state) {
+  const bits = collectBits(state);
+  const body = [];
+
+  // 1. Flags: 1 length byte + N bytes, trailing zero bytes trimmed
+  const flags = bitsToFlags(bits);
+  if (flags.length > 255) throw new Error('Flags section cannot exceed 255 bytes');
+  body.push(flags.length);
+  for (const b of flags) body.push(b);
+
+  // 2. Equipped: 3 varint indices per SET character bit, ascending bit order
+  const setChars = CHARACTER_BITS.filter((b) => bits.has(b));
+  for (const bit of setChars) {
+    const name = ROSTER_BY_BIT[bit];
+    if (name) {
+      const eq = state.gear.equipped[name];
+      varintEncode(ROSTER[name].bondedWeapon ? 0 : slotIndex(eq.weapon), body);   // bonded slot always 0
+      varintEncode(slotIndex(eq.acc[0]), body);
+      varintEncode(slotIndex(eq.acc[1]), body);
+    } else {
+      const u = state.unknownRecruits[bit];                                       // emitted exactly as read
+      for (let k = 0; k < 3; k++) varintEncode((u.slots[k] || 0) >>> 0, body);
+    }
+  }
+
+  // 3. Tier: 1 byte per set character bit, same order
+  for (const bit of setChars) {
+    const name = ROSTER_BY_BIT[bit];
+    body.push(name ? clamp(state.gear.tier[name] | 0, 1, 3) : (state.unknownRecruits[bit].tier & 0xff));
+  }
+
+  // 4. Endings: 1 length byte + N bytes; byte i = tier of game i+1; every vols index written; trailing zeros trimmed
+  const endings = [];
+  for (const vol of Object.keys(state.vols)) {
+    const n = volNumber(vol);
+    if (n === null) continue;
+    while (endings.length < n) endings.push(0);
+    endings[n - 1] = clamp(state.vols[vol].tier | 0, 0, 3);
+  }
+  while (endings.length && endings[endings.length - 1] === 0) endings.pop();
+  if (endings.length > 255) throw new Error('Endings section cannot exceed 255 bytes');
+  body.push(endings.length);
+  for (const b of endings) body.push(b);
+
+  // 5. Extension: appended verbatim
+  for (const b of state.extension) body.push(b & 0xff);
+
+  // 6. Checksum: FNV-1a 32-bit over sections 1–5, low 24 bits
+  return sealCode(state.s, body);
+}
+
+/* --------------------------------------------------------------------------
+   6. DECODER (Spec Section 7, step by step).
+   decode(input) → { ok: true, state, report, code } or { ok: false, reason }.
+   Nothing here throws on bad input.
+   -------------------------------------------------------------------------- */
+function normalise(raw) {
+  // Whitespace is removed (no valid code contains any). A repeated
+  // "MTT<digits>-" prefix, from pasting the code twice, collapses to one.
+  let s = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, '');
+  const m = /^MTT(\d+)-/.exec(s);
+  if (m) { const p = m[0]; while (s.startsWith(p + p)) s = s.slice(p.length); }
+  return s;
+}
+
+function validateEnvelope(code) {
+  // Order per spec: prefix, version digits, total length, then checksum.
+  if (!code.startsWith(SERIES_PREFIX)) return { ok: false, reason: 'not a Binary Connection code (prefix)' };
+  const dash = code.indexOf('-');                       // split on the FIRST dash only; base64url may contain dashes
+  if (dash < 0) return { ok: false, reason: 'no version separator' };
+  const versionText = code.slice(SERIES_PREFIX.length, dash);
+  if (!/^\d{1,9}$/.test(versionText)) return { ok: false, reason: 'version is not a number' };
+  if (code.length >= MAX_CODE_LENGTH) return { ok: false, reason: 'too long (' + code.length + ' characters)' };
+  const payload = code.slice(dash + 1);
+  const bytes = base64urlDecode(payload);
+  if (bytes === null) return { ok: false, reason: 'payload is not decodable' };
+  if (bytes.length < 3) return { ok: false, reason: 'payload too short for a checksum' };
+  const body = bytes.slice(0, bytes.length - 3);
+  const stored = (bytes[bytes.length - 3] << 16) | (bytes[bytes.length - 2] << 8) | bytes[bytes.length - 1];
+  if (stored !== checksum24(body)) return { ok: false, reason: 'checksum does not match' };
+  return { ok: true, version: parseInt(versionText, 10), body };
+}
+
+function readSections(body) {
+  // Sections 1–4 exactly as version 2 defines them; everything after Endings is Extension.
+  let pos = 0;
+  if (body.length < 1) return { ok: false, reason: 'flags length missing' };
+  const flagsLen = body[pos++];
+  if (pos + flagsLen > body.length) return { ok: false, reason: 'flags section runs past the end' };
+  const bits = flagsToBits(body.slice(pos, pos + flagsLen)); pos += flagsLen;
+  const bitSet = new Set(bits);
+  const chars = CHARACTER_BITS.filter((b) => bitSet.has(b)).map((bit) => ({ bit, slots: [0, 0, 0], tier: 1 }));
+  for (const c of chars) for (let k = 0; k < 3; k++) {
+    const r = varintRead(body, pos);
+    if (!r) return { ok: false, reason: 'equipped section runs past the end' };
+    c.slots[k] = r.value; pos = r.next;
+  }
+  for (const c of chars) {
+    if (pos >= body.length) return { ok: false, reason: 'tier section runs past the end' };
+    c.tier = body[pos++];
+  }
+  if (pos >= body.length) return { ok: false, reason: 'endings length missing' };
+  const endLen = body[pos++];
+  if (pos + endLen > body.length) return { ok: false, reason: 'endings section runs past the end' };
+  const endings = body.slice(pos, pos + endLen); pos += endLen;
+  const extension = body.slice(pos);
+  return { ok: true, bits, chars, endings, extension };
+}
+
+/* Migration chain plumbing (Step 5). Keyed by the version being migrated FROM.
+   None exists yet; the first real migration is a one-function change here. */
+const MIGRATIONS = Object.freeze({
+  // 1: (state, report) => { ... }   // schema 1 → 2
+});
+function migrate(state, fromVersion, report) {
+  for (let v = fromVersion; v < SCHEMA_VERSION; v++) {
+    if (typeof MIGRATIONS[v] === 'function') MIGRATIONS[v](state, report);
+    report.migrations.push(v + ' to ' + (v + 1));
+  }
+  state.s = SCHEMA_VERSION;
+}
+
+function resolveSlot(state, name, kind, index, slotLabel, report) {
+  if (index === 0) return null;                                        // empty or bonded
+  const who = titleOfCharacter(name);
+  if (kind === 'weapon' && ROSTER[name].bondedWeapon) {
+    report.notes.push(who + "'s weapon is bonded; a stray weapon index was cleared and the bonded weapon kept.");
+    return null;
+  }
+  const row = REGISTRY[index];
+  if (!row || !row.id) { report.notes.push(who + "'s " + slotLabel + ' pointed at an item this build does not know (bit ' + index + '); slot cleared, ownership kept.'); return null; }
+  if (row.kind !== kind) { report.notes.push(who + "'s " + slotLabel + ' held the wrong kind of item; slot cleared.'); return null; }
+  if (row.who !== name) { report.notes.push(who + "'s " + slotLabel + ' held an item that belongs to ' + titleOfCharacter(row.who) + '; slot cleared.'); return null; }
+  if (!state.gear.owned.includes(row.id)) { report.notes.push(who + "'s " + slotLabel + ' pointed at ' + titleOfItem(row.id) + ', which is not owned; slot cleared.'); return null; }
+  return row.id;
+}
+function sameFamily(idA, idB) {
+  if (!idA || !idB) return false;
+  const a = REGISTRY[REGISTRY_BIT.get(idA)], b = REGISTRY[REGISTRY_BIT.get(idB)];
+  const rootA = a.variantOf !== undefined ? a.variantOf : REGISTRY_BIT.get(idA);
+  const rootB = b.variantOf !== undefined ? b.variantOf : REGISTRY_BIT.get(idB);
+  return rootA === rootB;
+}
+
+function decode(input) {
+  // Step 1 — defaults. The game is playable before anything is read.
+  const state = defaultState();
+  const report = { version: SCHEMA_VERSION, forward: false, migrations: [], notes: [] };
+
+  // Step 3 — normalise, then validate the envelope and checksum.
+  const code = normalise(input);
+  const env = validateEnvelope(code);
+  if (!env.ok) return { ok: false, reason: env.reason };
+  report.version = env.version;
+
+  // Step 4 — decode sections 1–4; everything else is extension.
+  const sec = readSections(env.body);
+  if (!sec.ok) return { ok: false, reason: sec.reason };
+
+  for (const bit of sec.bits) {                                          // Flags → facts
+    if (CHARACTER_BIT_SET.has(bit)) {
+      const name = ROSTER_BY_BIT[bit];
+      if (name) state.crew[name].unlocked = true;                        // unknown recruits are handled with their slots below
+      continue;
+    }
+    const row = REGISTRY[bit];
+    if (!row || !row.id) { state.unknownBits.push(bit); continue; }    // retired, reserved or beyond the table
+    if (row.kind === 'accessory' || row.kind === 'weapon') state.gear.owned.push(row.id);
+    else if (row.kind === 'ability') {
+      if (ROSTER[row.who]) state.crew[row.who].abilities.push(row.id);
+      else state.gear.owned.push(row.id);                                // owner not yet named: kept as an owned ID so the bit survives
+    }
+    else state.unknownBits.push(bit);
+  }
+  state.crew.gold.unlocked = true;                                       // Gold is always present
+
+  for (const c of sec.chars) {                                           // Equipped + Tier, sized by set character bits
+    const name = ROSTER_BY_BIT[c.bit];
+    if (!name) { state.unknownRecruits[c.bit] = { slots: c.slots.slice(), tier: c.tier }; continue; }
+    const eq = state.gear.equipped[name];
+    eq.weapon = resolveSlot(state, name, 'weapon', c.slots[0], 'weapon slot', report);      // Step 6 — resolve defensively
+    eq.acc[0] = resolveSlot(state, name, 'accessory', c.slots[1], 'first accessory slot', report);
+    eq.acc[1] = resolveSlot(state, name, 'accessory', c.slots[2], 'second accessory slot', report);
+    if (eq.acc[1] !== null && sameFamily(eq.acc[0], eq.acc[1])) {
+      report.notes.push(titleOfCharacter(name) + ' had the same accessory, or its modified variant, in both slots; the second was cleared.');
+      eq.acc[1] = null;
+    }
+    const tier = clamp(c.tier, 1, 3);
+    if (tier !== c.tier) report.notes.push(titleOfCharacter(name) + "'s weapon tier was out of range and was clamped to " + tier + '.');
+    state.gear.tier[name] = tier;
+  }
+
+  for (let i = 0; i < sec.endings.length; i++) {                         // every Endings index → vols, known game or not
+    const vol = 'vol' + (i + 1);
+    const tier = clamp(sec.endings[i], 0, 3);
+    if (tier !== sec.endings[i]) report.notes.push('Ending tier for ' + titleOfGame(vol) + ' was out of range and was clamped to ' + tier + '.');
+    state.vols[vol] = { tier };
+  }
+  state.extension = sec.extension.slice();
+
+  // Step 5 — version handling.
+  if (env.version < SCHEMA_VERSION) migrate(state, env.version, report);   // lower: migration chain
+  else state.s = env.version;                                              // 2 loads directly; higher keeps its number (forward mode)
+  report.forward = env.version > SCHEMA_VERSION;
+
+  return { ok: true, state, report, code };
+}
+
+/* Step 7 — sync to band. Stats come from the current game's level band table
+   plus weapon tier; that table belongs to the game layer and is not on this
+   branch. What the engine resolves here: accessory dependencies (dormant with
+   a plain-English reason, never dropped) and each character's loadout view. */
+function loadout(state) {
+  const dormant = [];
+  for (const id of state.gear.owned) {
+    const row = REGISTRY[REGISTRY_BIT.get(id)];
+    if (row && row.requires && !PROVIDED_CAPABILITIES.has(row.requires)) {
+      dormant.push({ id, reason: titleOfItem(id) + ' needs ' + (CAPABILITY_TITLES[row.requires] || 'something this game does not have') +
+        ', which is not available here. It stays in the collection and wakes when it is.' });
+    }
+  }
+  const characters = {};
+  for (const name of CHARACTERS) {
+    const def = ROSTER[name], eq = state.gear.equipped[name];
+    characters[name] = {
+      unlocked: state.crew[name].unlocked,
+      weapon: def.bondedWeapon ? { bonded: true, key: def.bondedWeapon } : { bonded: false, id: eq.weapon },
+      acc: eq.acc.slice(),
+      tier: state.gear.tier[name],
+      abilities: state.crew[name].abilities.slice(),
+    };
+  }
+  return { characters, dormant };
+}
+
+/* --------------------------------------------------------------------------
+   8. STORAGE. Every read and write in try/catch. In blocked browsers the
+   storage object throws, it does not return null. The cache stores the code
+   string itself and nothing else.
+   -------------------------------------------------------------------------- */
+const KEYS = Object.freeze({
+  crew: 'mtt.crew',
+  bak: 'mtt.crew.bak',
+  quarantine: 'mtt.crew.quarantine',
+  progress: 'mtt.vol2.progress',   // volume progress; outside the contract, embeds a copy of the code string
+});
+
+const Store = {
+  provider: () => window.localStorage,   // the harness swaps this for fakes; property access itself may throw
+  read(key) {
+    try {
+      const v = this.provider().getItem(key);
+      return { ok: true, value: typeof v === 'string' ? v : null };
+    } catch (e) { return { ok: false, value: null, error: e }; }
+  },
+  write(key, value) {
+    try { this.provider().setItem(key, String(value)); return { ok: true }; }
+    catch (e) { return { ok: false, error: e }; }
+  },
+  writeIfEmpty(key, value) {   // never overwrites an existing non-empty value
+    const cur = this.read(key);
+    if (!cur.ok) return { ok: false, error: cur.error };
+    if (cur.value !== null && cur.value !== '') return { ok: true, skipped: true };
+    return this.write(key, value);
+  },
+};
+
+const Session = { bindNoticeShown: false, reset() { this.bindNoticeShown = false; } };
+
+function writeCache(code) {
+  // Step 8: copy the previous mtt.crew into mtt.crew.bak, then write the new code.
+  const notices = [];
+  const prev = Store.read(KEYS.crew);
+  if (prev.ok && prev.value !== null) Store.write(KEYS.bak, prev.value);
+  const w = Store.write(KEYS.crew, code);
+  if (!w.ok && !Session.bindNoticeShown) { Session.bindNoticeShown = true; notices.push(COPY.bindNotice); }   // once, calmly
+  return notices;
+}
+function quarantine(code) { Store.writeIfEmpty(KEYS.quarantine, code); }
+
+function acquireCachedCode() {
+  // Step 2: mtt.crew, then mtt.crew.bak. A throw or an absent value means no cache.
+  // Volume progress embeds a copy of the code so Continue is self-contained.
+  const sources = [KEYS.crew, KEYS.bak];
+  const found = [];
+  for (const key of sources) {
+    const r = Store.read(key);
+    if (r.ok && r.value !== null && r.value.trim() !== '') found.push({ key, code: r.value });
+  }
+  const p = Store.read(KEYS.progress);
+  if (p.ok && p.value) {
+    try { const obj = JSON.parse(p.value); if (obj && typeof obj.code === 'string' && obj.code.trim() !== '') found.push({ key: KEYS.progress, code: obj.code }); }
+    catch (e) { /* progress is not ours to validate */ }
+  }
+  return found;
+}
+
+function loadFromCache() {
+  // The cached path. A failing cached code is silent: quarantined once, then a clean crew.
+  const candidates = acquireCachedCode();
+  let quarantined = false;
+  for (const c of candidates) {
+    const d = decode(c.code);
+    if (d.ok) {
+      const notices = writeCache(encode(d.state));
+      return { ok: true, state: d.state, report: d.report, source: c.key, quarantined, notices };
+    }
+    if (!quarantined) { quarantine(c.code); quarantined = true; }
+  }
+  return { ok: true, state: defaultState(), report: null, source: 'fresh', quarantined, notices: [] };
+}
+
+function restore(pasted, current) {
+  // The pasted path. Failure shows "Connection incomplete" and leaves the current crew exactly as it was.
+  const d = decode(pasted);
+  if (!d.ok) return { ok: false, message: COPY.failure, reason: d.reason, state: current, notices: [] };
+  const notices = writeCache(encode(d.state));
+  return { ok: true, message: COPY.success, state: d.state, report: d.report, notices };
+}
+
+function bind(state) {
+  // "Bind this run to your watch." Produces the code and caches it.
+  const code = encode(state);
+  return { code, notices: writeCache(code) };
+}
+
+/* --------------------------------------------------------------------------
+   Plain-English description of a decoded state (for ?decode=).
+   -------------------------------------------------------------------------- */
+function describeState(state, report) {
+  const lines = [];
+  const add = (k, v) => lines.push({ k, v });
+  let version = 'schema version ' + state.s;
+  if (report && report.forward) version += ' (newer than this build; read in forward mode, extra data kept)';
+  if (report && report.migrations.length) version += ' (migrated from version ' + report.version + ')';
+  add('Version', version);
+
+  add('Crew', CHARACTERS.filter((n) => !ROSTER[n].playableFrom && state.crew[n].unlocked).map(titleOfCharacter).join(', ') || 'none');
+  const recruits = CHARACTERS.filter((n) => ROSTER[n].playableFrom && state.crew[n].unlocked)
+    .map((n) => titleOfCharacter(n) + ' (recruited; playable from ' + titleOfGame(ROSTER[n].playableFrom) + ')');
+  add('Recruits', recruits.join(', ') || 'none');
+
+  const abilities = [];
+  for (const n of CHARACTERS) for (const id of state.crew[n].abilities) abilities.push(titleOfItem(id) + ' — ' + titleOfCharacter(n));
+  for (const id of state.gear.owned) { const row = REGISTRY[REGISTRY_BIT.get(id)]; if (row && row.kind === 'ability') abilities.push(titleOfItem(id)); }
+  add('Abilities', abilities.join('; ') || 'none');
+
+  const lo = loadout(state);
+  const gear = state.gear.owned.filter((id) => REGISTRY[REGISTRY_BIT.get(id)].kind !== 'ability').map((id) => {
+    const d = lo.dormant.find((x) => x.id === id);
+    return titleOfItem(id) + (d ? ' (dormant)' : '');
+  });
+  add('Gear', gear.join('; ') || 'none');
+
+  const cleared = Object.keys(state.vols).filter((v) => state.vols[v].tier > 0).sort((a, b) => volNumber(a) - volNumber(b))
+    .map((v) => titleOfGame(v) + ' — ending tier ' + state.vols[v].tier);
+  add('Games cleared', cleared.join('; ') || 'none');
+
+  for (const n of CHARACTERS) {
+    if (!state.crew[n].unlocked) continue;
+    const c = lo.characters[n];
+    const weapon = c.weapon.bonded ? (BONDED_TITLES[c.weapon.key] || 'Bonded weapon') + ' (bonded)' : (c.weapon.id ? titleOfItem(c.weapon.id) : 'empty');
+    const acc = c.acc.map((id) => (id ? titleOfItem(id) : 'empty')).join(', ');
+    add('Equipped — ' + titleOfCharacter(n), 'weapon: ' + weapon + ' at tier ' + c.tier + '; accessories: ' + acc);
+  }
+  for (const d of lo.dormant) add('Dormant', d.reason);
+
+  add('Unrecognised bits', state.unknownBits.length ? state.unknownBits.join(', ') + ' (kept, inert)' : 'none');
+  const ur = Object.keys(state.unknownRecruits).map((b) => 'bit ' + b + ' (slots ' + state.unknownRecruits[b].slots.join(', ') + '; tier ' + state.unknownRecruits[b].tier + ')');
+  add('Unrecognised recruits', ur.join('; ') || 'none');
+  add('Extra data', state.extension.length ? state.extension.length + ' byte' + (state.extension.length === 1 ? '' : 's') + ' kept for a newer version' : 'none');
+  if (report && report.notes.length) add('Notes', report.notes.join(' '));
+  return lines;
+}
+</script>
+
+<script id="harness">
+'use strict';
+/* ==========================================================================
+   REGRESSION HARNESS — ?test=save runs every case from Spec Section 8.
+   Every fixture is stored with its expected decoded result; the test asserts
+   the data matches. Canonical fixtures also assert encode(expected) === code.
+   Corpus rule: append-only. Add fixtures; never edit or delete one.
+   ========================================================================== */
+
+/* ---- assertion plumbing ---------------------------------------------------- */
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i] || !deepEqual(a[ka[i]], b[kb[i]])) return false;
+  return true;
+}
+function show(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+function makeT() {
+  const failures = [];
+  return {
+    failures,
+    ok(cond, label) { if (!cond) failures.push(label); },
+    eq(actual, expected, label) { if (!deepEqual(actual, expected)) failures.push(label + '\n  expected ' + show(expected) + '\n  actual   ' + show(actual)); },
+    same(actual, expected, label) { if (actual !== expected) failures.push(label + '\n  expected ' + show(expected) + '\n  actual   ' + show(actual)); },
+  };
+}
+
+/* ---- fake storage ---------------------------------------------------------- */
+function memoryStorage(init) {
+  const m = new Map(Object.entries(init || {}));
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => { m.set(k, String(v)); },
+    removeItem: (k) => { m.delete(k); },
+    dump: () => Object.fromEntries(m),
+  };
+}
+function quotaStorage(init) {
+  const m = memoryStorage(init);
+  return { getItem: m.getItem, setItem() { throw new Error('QuotaExceededError'); }, dump: m.dump };
+}
+function useStorage(storage) { Store.provider = () => storage; Session.reset(); return storage; }
+function useThrowingStorage() { Store.provider = () => { throw new Error('SecurityError: storage is blocked'); }; Session.reset(); }
+
+/* ---- fixture builders ------------------------------------------------------ */
+const ID = (bit) => REGISTRY[bit].id;
+function build(fn) { const s = defaultState(); fn(s); return s; }
+function equip(s, name, weaponBit, acc1Bit, acc2Bit) {
+  s.gear.equipped[name].weapon = weaponBit ? ID(weaponBit) : null;
+  s.gear.equipped[name].acc = [acc1Bit ? ID(acc1Bit) : null, acc2Bit ? ID(acc2Bit) : null];
+}
+function assemble(o) {
+  // Hand-assembled input: { version, bits, chars: [[w, a1, a2, tier], ...] in ascending set-character-bit order, endings, extension }
+  const body = [];
+  const flags = bitsToFlags(new Set(o.bits || []));
+  body.push(flags.length); for (const b of flags) body.push(b);
+  for (const c of o.chars || []) for (let k = 0; k < 3; k++) varintEncode(c[k], body);
+  for (const c of o.chars || []) body.push(c[3]);
+  const endings = o.endings || [];
+  body.push(endings.length); for (const b of endings) body.push(b);
+  for (const b of o.extension || []) body.push(b);
+  return sealCode(o.version === undefined ? 2 : o.version, body);
+}
+function bytesOf(code) { return base64urlDecode(code.slice(code.indexOf('-') + 1)); }
+function reseal(code, mutate) {   // mutate the body, recompute the checksum (structural tests)
+  const bytes = bytesOf(code); const body = bytes.slice(0, -3); mutate(body);
+  return sealCode(code.slice(3, code.indexOf('-')), body);
+}
+function corrupt(code, mutate) {  // mutate the body, keep the old checksum (checksum tests)
+  const bytes = bytesOf(code); const body = bytes.slice(0, -3); mutate(body);
+  return code.slice(0, code.indexOf('-') + 1) + base64urlEncode(body.concat(bytes.slice(-3)));
+}
+
+/* ---- expected states -------------------------------------------------------- */
+const EXPECT = {
+  clean: () => defaultState(),
+  mid: () => build((s) => {
+    unlockCharacter(s, 'silver'); grantGear(s, 33); grantGear(s, 40);
+    equip(s, 'gold', 40, 0, 0); equip(s, 'silver', 0, 33, 0); s.gear.tier.gold = 2;
+  }),
+  full: () => build((s) => {   // complete Volume Two run: full crew, chemist, all nine exclusives, ability, everything equipped
+    for (const n of CHARACTERS) unlockCharacter(s, n);
+    for (const b of [32, 33, 34, 35, 36, 40, 41, 42, 43, 64]) grantGear(s, b);
+    equip(s, 'gold', 40, 36, 0); equip(s, 'silver', 41, 33, 0); equip(s, 'titanium', 42, 32, 0); equip(s, 'platinum', 43, 34, 0);
+    for (const n of CHARACTERS) s.gear.tier[n] = 3;
+    recordEnding(s, 'vol2', 3);
+  }),
+  unknownBits: () => build((s) => { s.unknownBits = [4, 37, 300]; }),
+  unknownRecruit: () => build((s) => {
+    unlockCharacter(s, 'silver'); grantGear(s, 33); equip(s, 'silver', 0, 33, 0);
+    s.unknownRecruits[9] = { slots: [130, 5, 0], tier: 2 };
+  }),
+  unknownRecruitThreeGames: () => build((s) => {
+    unlockCharacter(s, 'silver'); grantGear(s, 33); equip(s, 'silver', 0, 33, 0);
+    s.unknownRecruits[9] = { slots: [130, 5, 0], tier: 2 };
+    recordEnding(s, 'vol1', 1); recordEnding(s, 'vol2', 2); recordEnding(s, 'vol3', 3);
+  }),
+  twoByte: () => build((s) => { s.unknownRecruits[8] = { slots: [130, 0, 0], tier: 1 }; s.gear.tier.gold = 3; }),
+  forward: () => build((s) => {
+    s.s = 99; unlockCharacter(s, 'silver'); grantGear(s, 33); grantGear(s, 40);
+    equip(s, 'gold', 40, 0, 0); equip(s, 'silver', 0, 33, 0); s.gear.tier.gold = 2; s.extension = [7, 7, 7];
+  }),
+  growthSeed: () => build((s) => {   // unknown recruit + unknown registry bits + extension, from a newer version
+    s.s = 99; unlockCharacter(s, 'silver'); grantGear(s, 33); equip(s, 'silver', 0, 33, 0);
+    s.unknownBits = [37, 300]; s.unknownRecruits[9] = { slots: [130, 5, 0], tier: 2 }; s.extension = [0xfb, 0x01, 0x02];
+  }),
+  goldBoth: () => build((s) => { grantGear(s, 35); grantGear(s, 36); equip(s, 'gold', 0, 36, 0); }),
+  chip: () => build((s) => { unlockCharacter(s, 'titanium'); grantGear(s, 32); equip(s, 'titanium', 0, 32, 0); }),
+  farEnding: () => build((s) => { recordEnding(s, 'vol7', 2); }),
+};
+
+/* ---- the fixture corpus (append-only) -------------------------------------
+   Each canonical fixture is exactly what encode(expected()) emits. The
+   harness asserts that, so a drift in the encoder shows as a FAIL here. */
+const FIXTURES = {
+  clean:                    { code: 'MTT2-AQEAAAABACicvA', expect: EXPECT.clean },
+  mid:                      { code: 'MTT2-BgMAAAACASgAAAAhAAIBALu-yQ', expect: EXPECT.mid },
+  full:                     { code: 'MTT2-CU8AAAAfDwAAASgkACkhACogACsiAAAAAAMDAwMDAgAD-FHd', expect: EXPECT.full },
+  unknownBits:              { code: 'MTT2-JhEAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAQATMlE', expect: EXPECT.unknownBits },
+  unknownRecruit:           { code: 'MTT2-BQMCAAACAAAAACEAggEFAAEBAgCkaRQ', expect: EXPECT.unknownRecruit },
+  unknownRecruitThreeGames: { code: 'MTT2-BQMCAAACAAAAACEAggEFAAEBAgMBAgM-wgM', expect: EXPECT.unknownRecruitThreeGames },
+  twoByte:                  { code: 'MTT2-AgEBAAAAggEAAAMBALUCpA', expect: EXPECT.twoByte },
+  forward:                  { code: 'MTT99-BgMAAAACASgAAAAhAAIBAAcHB4ZUkA', expect: EXPECT.forward },
+  growthSeed:               { code: 'MTT99-JgMCAAAiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAACEAggEFAAEBAgD7AQJMULM', expect: EXPECT.growthSeed },
+  goldBoth:                 { code: 'MTT2-BQEAAAAYACQAAQCdvbw', expect: EXPECT.goldBoth },
+  chip:                     { code: 'MTT2-BQUAAAABAAAAACAAAQEA9iu2', expect: EXPECT.chip },
+  farEnding:                { code: 'MTT2-AQEAAAABBwAAAAAAAAIv4Fk', expect: EXPECT.farEnding },
+};
+
+/* ---- cases ------------------------------------------------------------------ */
+const CASES = [];
+function testCase(n, name, fn) { CASES.push({ n, name, fn }); }
+
+function assertDecodes(t, code, expected, label) {
+  const d = decode(code);
+  t.ok(d.ok, label + ': decodes (' + (d.ok ? 'ok' : d.reason) + ')');
+  if (d.ok) { t.eq(d.state, expected, label + ': decoded state matches expected'); t.ok(isPlayable(d.state), label + ': playable'); }
+  return d;
+}
+function assertCanonical(t, fx, label) {
+  const expected = fx.expect();
+  t.same(encode(expected), fx.code, label + ': fixture is canonical (encode(expected) === code)');
+  const d = assertDecodes(t, fx.code, expected, label);
+  if (d.ok) t.same(encode(d.state), fx.code, label + ': re-encode is byte-identical');
+  return d;
+}
+
+testCase('E1', 'Engine: FNV-1a 32 known vectors and 24-bit truncation', (t) => {
+  t.same(fnv1a32([]), 0x811c9dc5, 'empty input');
+  t.same(fnv1a32([0x61]), 0xe40c292c, '"a"');
+  t.same(fnv1a32([0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]), 0xbf9cf968, '"foobar"');
+  t.same(checksum24([0x61]), 0x0c292c, 'low 24 bits of "a"');
+  t.eq(checksumBytes([0x61]), [0x0c, 0x29, 0x2c], 'three checksum bytes, big-endian');
+});
+
+testCase('E2', 'Engine: base-128 varints are canonical and minimal', (t) => {
+  t.eq(varintEncode(0, []), [0], '0');
+  t.eq(varintEncode(127, []), [127], '127 is one byte');
+  t.eq(varintEncode(128, []), [0x80, 0x01], '128 is two bytes');
+  t.eq(varintEncode(255, []), [0xff, 0x01], '255');
+  t.eq(varintEncode(300, []), [0xac, 0x02], '300');
+  t.eq(varintEncode(16383, []), [0xff, 0x7f], '16383 is two bytes');
+  for (const v of [0, 1, 127, 128, 255, 300, 16383, 16384]) t.eq(varintRead(varintEncode(v, []), 0).value, v, 'round trip ' + v);
+  t.same(varintRead([0x80], 0), null, 'truncated varint is rejected');
+});
+
+testCase('E3', 'Engine: base64url is strict, unpadded, and round-trips', (t) => {
+  for (const n of [0, 1, 2, 3, 4, 5, 6]) {
+    const bytes = Array.from({ length: n }, (_, i) => (i * 97 + 13) & 0xff);
+    t.eq(base64urlDecode(base64urlEncode(bytes)), bytes, 'round trip ' + n + ' bytes');
+  }
+  t.same(base64urlEncode([0xfb, 0xff]), '-_8', 'uses - and _ with no padding');
+  t.same(base64urlDecode('AB=='), null, 'padding is rejected');
+  t.same(base64urlDecode('A'), null, 'impossible length is rejected');
+  t.eq(base64urlDecode('AQ'), [1], 'two characters decode to one byte');
+  t.same(base64urlDecode('AC'), null, 'non-zero leftover bits are rejected');
+});
+
+testCase('E4', 'Engine: registry integrity, frozen sets, display tables', (t) => {
+  t.same(REGISTRY.length, 224, 'registry covers bits 0–223');
+  t.same(REGISTRY[4], RETIRED, 'bit 4 retired'); t.same(REGISTRY[5], RETIRED, 'bit 5 retired');
+  t.eq(CHARACTER_BITS, [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], 'character bit set is {0–3, 6–15}');
+  t.ok(Object.isFrozen(REGISTRY) && Object.isFrozen(CHARACTER_BITS), 'registry and character bits are frozen');
+  const seen = new Set();
+  REGISTRY.forEach((row, bit) => {
+    if (!row || !row.id) return;
+    t.ok(!seen.has(row.id), 'duplicate ID at bit ' + bit); seen.add(row.id);
+    t.same(REGISTRY_BIT.get(row.id), bit, 'ID → bit lookup for bit ' + bit);
+    t.ok(typeof ITEM_TITLES[row.id] === 'string', 'display title exists for bit ' + bit);
+    t.ok(!ITEM_TITLES[row.id].includes(row.id), 'display title for bit ' + bit + ' is not built from its ID');
+    if (row.kind === 'crew' || row.kind === 'recruit') t.ok(CHARACTER_BIT_SET.has(bit), 'character row at a character bit ' + bit);
+  });
+  t.ok(!REGISTRY.some((r) => r && r.id && /chemistry/i.test(r.id)), 'bonded chemistry book has no registry bit');
+  for (const v of ['vol1', 'vol2', 'vol3']) t.ok(typeof GAME_TITLES[v] === 'string' && !/vol\d/.test(GAME_TITLES[v]), 'public title for ' + v + ' carries no ordinal');
+  t.eq(CHARACTERS, ['gold', 'silver', 'titanium', 'platinum', 'chemist'], 'roster in ascending bit order');
+  t.ok(defaultState().crew.gold.unlocked === true, 'default state has Gold');
+  t.ok(isPlayable(defaultState()), 'default state is playable');
+});
+
+testCase(1, 'No code, no cache (the common path)', (t) => {
+  const st = useStorage(memoryStorage({}));
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  t.same(r.source, 'fresh', 'fresh start');
+  t.eq(r.notices, [], 'silent, zero prompts');
+  t.same(r.quarantined, false, 'nothing quarantined');
+  t.eq(st.dump(), {}, 'nothing written');
+  t.ok(isPlayable(r.state), 'playable');
+});
+
+testCase(2, 'localStorage throws (Safari ITP, blocked cookies)', (t) => {
+  useThrowingStorage();
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  t.eq(r.notices, [], 'silent on read');
+  const b = bind(EXPECT.mid());
+  t.same(b.code, FIXTURES.mid.code, 'binding still produces the code');
+  t.eq(b.notices, [COPY.bindNotice], 'one calm notice when the write fails');
+  t.ok(isPlayable(r.state), 'game normal');
+});
+
+testCase(3, 'Quota exceeded on write', (t) => {
+  useStorage(quotaStorage({}));
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  const b1 = bind(EXPECT.mid());
+  t.eq(b1.notices, [COPY.bindNotice], 'one calm notice');
+  const b2 = bind(EXPECT.mid());
+  t.eq(b2.notices, [], 'the notice is shown once');
+  t.same(b2.code, FIXTURES.mid.code, 'the code is still produced');
+});
+
+testCase(4, 'Cache present but empty string', (t) => {
+  const st = useStorage(memoryStorage({ 'mtt.crew': '' }));
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  t.eq(r.notices, [], 'silent');
+  t.same(st.dump()['mtt.crew.quarantine'], undefined, 'nothing quarantined');
+});
+
+testCase(5, 'Cache present, not decodable', (t) => {
+  const st = useStorage(memoryStorage({ 'mtt.crew': 'not a real code' }));
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  t.eq(r.notices, [], 'silent');
+  t.same(r.quarantined, true, 'quarantined');
+  t.same(st.dump()['mtt.crew.quarantine'], 'not a real code', 'bad cache copied to quarantine');
+});
+
+testCase(6, 'Quarantine already occupied, second bad cache', (t) => {
+  const st = useStorage(memoryStorage({ 'mtt.crew.quarantine': 'FIRST', 'mtt.crew': 'second bad cache' }));
+  const r = loadFromCache();
+  t.eq(r.state, EXPECT.clean(), 'clean crew');
+  t.same(st.dump()['mtt.crew.quarantine'], 'FIRST', 'first quarantine untouched');
+});
+
+testCase(7, 'Safari wiped storage after 7 days', (t) => {
+  const st = useStorage(memoryStorage({}));
+  t.eq(loadFromCache().state, EXPECT.clean(), 'clean crew');
+  const r = restore(FIXTURES.full.code, defaultState());
+  t.same(r.ok, true, 'pasted code restores');
+  t.same(r.message, COPY.success, 'success copy');
+  t.eq(r.state, EXPECT.full(), 'fully restored');
+  t.same(st.dump()['mtt.crew'], FIXTURES.full.code, 'cache rewritten');
+});
+
+testCase(8, 'Player has only ever played this game', (t) => {
+  const st = useStorage(memoryStorage({}));
+  const first = loadFromCache();
+  t.same(first.source, 'fresh', 'starts fresh');
+  const s = first.state;
+  unlockCharacter(s, 'silver'); grantGear(s, 40); grantGear(s, 33); grantGear(s, 40);   // re-finding is idempotent
+  equip(s, 'gold', 40, 0, 0); equip(s, 'silver', 0, 33, 0); s.gear.tier.gold = 2;
+  const b = bind(s);
+  t.same(b.code, FIXTURES.mid.code, 'bound code is canonical');
+  t.eq(b.notices, [], 'no notices');
+  t.same(st.dump()['mtt.crew'], FIXTURES.mid.code, 'cached');
+  const again = loadFromCache();
+  t.same(again.source, 'mtt.crew', 'continues from cache');
+  t.eq(again.state, s, 'continue restores the same run');
+  t.same(st.dump()['mtt.crew.bak'], FIXTURES.mid.code, 'previous cache copied to backup');
+});
+
+testCase(9, 'Pasted code, wrong prefix', (t) => {
+  const st = useStorage(memoryStorage({ 'mtt.crew': FIXTURES.mid.code }));
+  const current = loadFromCache().state; const before = show(current); const dump = show(st.dump());
+  const r = restore('ABC2-' + FIXTURES.full.code.slice(5), current);
+  t.same(r.ok, false, 'rejected'); t.same(r.message, COPY.failure, 'incomplete copy');
+  t.same(r.state, current, 'current crew object untouched'); t.same(show(current), before, 'current crew data untouched');
+  t.same(show(st.dump()), dump, 'storage untouched');
+});
+
+testCase(10, 'Pasted code truncated', (t) => {
+  useStorage(memoryStorage({}));
+  const current = EXPECT.mid(); const before = show(current);
+  for (const cut of [1, 4, 9, 20]) {
+    const r = restore(FIXTURES.full.code.slice(0, -cut), current);
+    t.same(r.ok, false, 'truncated by ' + cut + ' rejected (' + r.reason + ')');
+    t.same(r.message, COPY.failure, 'incomplete copy');
+  }
+  t.same(show(current), before, 'current crew untouched');
+});
+
+testCase(11, 'Pasted code, one character altered', (t) => {
+  useStorage(memoryStorage({}));
+  const code = FIXTURES.full.code; const current = EXPECT.mid();
+  let checked = 0;
+  for (let i = 5; i < code.length; i += 3) {
+    const alt = code[i] === 'A' ? 'B' : 'A';
+    const r = restore(code.slice(0, i) + alt + code.slice(i + 1), current);
+    t.same(r.ok, false, 'alteration at ' + i + ' rejected'); checked++;
+  }
+  t.ok(checked > 10, 'many positions checked');
+});
+
+testCase(12, 'Trailing whitespace or newline', (t) => {
+  useStorage(memoryStorage({}));
+  assertDecodes(t, FIXTURES.mid.code + '\n', EXPECT.mid(), 'newline');
+  assertDecodes(t, '  ' + FIXTURES.mid.code + ' \r\n\t', EXPECT.mid(), 'spaces and CRLF');
+  const r = restore(FIXTURES.mid.code + '\n', defaultState());
+  t.same(r.ok, true, 'restore accepts it');
+});
+
+testCase(13, 'Prefix pasted twice', (t) => {
+  useStorage(memoryStorage({}));
+  assertDecodes(t, 'MTT2-' + FIXTURES.mid.code, EXPECT.mid(), 'twice');
+  assertDecodes(t, 'MTT2-MTT2-' + FIXTURES.mid.code, EXPECT.mid(), 'three times');
+  assertDecodes(t, 'MTT99-' + FIXTURES.forward.code, EXPECT.forward(), 'twice, version 99');
+});
+
+testCase(14, 'Payload containing dashes', (t) => {
+  const dashed = Object.keys(FIXTURES).filter((n) => FIXTURES[n].code.slice(FIXTURES[n].code.indexOf('-') + 1).includes('-'));
+  t.ok(dashed.length >= 1, 'at least one canonical fixture has a dash inside its payload (' + dashed.join(', ') + ')');
+  for (const n of dashed) assertCanonical(t, FIXTURES[n], n + ' (dashed payload)');
+  const d = decode(FIXTURES.full.code);
+  t.ok(d.ok && d.state.s === 2, 'version read from the first dash only');
+});
+
+testCase(15, 'Lower version code', (t) => {
+  const code = 'MTT1-' + FIXTURES.mid.code.slice(5);
+  const d = decode(code);
+  t.ok(d.ok, 'loads (' + (d.ok ? 'ok' : d.reason) + ')');
+  if (d.ok) {
+    t.eq(d.report.migrations, ['1 to 2'], 'migration chain ran');
+    t.same(d.state.s, 2, 'migrated to schema 2');
+    t.eq(d.state, EXPECT.mid(), 'data intact');
+    t.same(encode(d.state), FIXTURES.mid.code, 'writes back as version 2');
+  }
+  const d0 = decode('MTT0-' + FIXTURES.mid.code.slice(5));
+  t.ok(d0.ok && d0.report.migrations.length === 2, 'version 0 runs the whole chain');
+});
+
+testCase(16, 'Version 99 code with extra trailing section', (t) => {
+  const d = assertCanonical(t, FIXTURES.forward, 'forward');
+  if (d.ok) {
+    t.same(d.report.forward, true, 'forward mode');
+    t.eq(d.state.extension, [7, 7, 7], 'extension preserved');
+    t.same(d.state.s, 99, 'original version kept');
+    t.ok(encode(d.state).startsWith('MTT99-'), 'write-back keeps version 99');
+  }
+});
+
+testCase(17, 'Registry bit set beyond this build\'s table', (t) => {
+  const d = assertCanonical(t, FIXTURES.unknownBits, 'unknown bits');
+  if (d.ok) {
+    t.eq(d.state.unknownBits, [4, 37, 300], 'retired, reserved and beyond-table bits preserved');
+    t.eq(d.state.gear.owned, [], 'inert: nothing resolved from them');
+    t.eq(d.state.crew.gold.abilities, [], 'no abilities resolved');
+  }
+});
+
+testCase(18, 'Equipped index → unowned item', (t) => {
+  // Silver's first accessory points at bit 33 while bit 33 is not set.
+  const code = assemble({ bits: [0, 1, 40], chars: [[40, 0, 0, 2], [0, 33, 0, 1]] });
+  const expected = build((s) => { unlockCharacter(s, 'silver'); grantGear(s, 40); equip(s, 'gold', 40, 0, 0); s.gear.tier.gold = 2; });
+  const d = assertDecodes(t, code, expected, 'unowned');
+  if (d.ok) t.ok(d.report.notes.some((n) => /not owned/.test(n)), 'reason recorded');
+});
+
+testCase(19, 'Equipped index → unknown item', (t) => {
+  // Bit 37 is set (unknown) and Gold's first accessory points at it.
+  const code = assemble({ bits: [0, 37], chars: [[0, 37, 0, 1]] });
+  const expected = build((s) => { s.unknownBits = [37]; });
+  const d = assertDecodes(t, code, expected, 'unknown item');
+  if (d.ok) { t.eq(d.state.unknownBits, [37], 'ownership bit preserved'); t.same(d.state.gear.equipped.gold.acc[0], null, 'slot cleared'); }
+});
+
+testCase(20, 'Weapon index in accessory slot', (t) => {
+  const code = assemble({ bits: [0, 2, 32, 42], chars: [[0, 0, 0, 1], [32, 42, 0, 1]] });   // Titanium: accessory in weapon slot, weapon in accessory slot
+  const expected = build((s) => { unlockCharacter(s, 'titanium'); grantGear(s, 32); grantGear(s, 42); });
+  const d = assertDecodes(t, code, expected, 'wrong kind');
+  if (d.ok) t.eq(d.state.gear.equipped.titanium, { weapon: null, acc: [null, null] }, 'both slots cleared');
+});
+
+testCase(21, 'Item equipped to wrong character', (t) => {
+  const code = assemble({ bits: [0, 2, 32, 40], chars: [[0, 32, 0, 1], [40, 0, 0, 1]] });   // Gold wears Titanium's chip; Titanium wields Gold's weapon
+  const expected = build((s) => { unlockCharacter(s, 'titanium'); grantGear(s, 32); grantGear(s, 40); });
+  const d = assertDecodes(t, code, expected, 'wrong character');
+  if (d.ok) t.ok(d.report.notes.filter((n) => /belongs to/.test(n)).length === 2, 'both cleared with reasons');
+});
+
+testCase(22, 'Non-zero index in a bonded slot', (t) => {
+  const code = assemble({ bits: [0, 6, 40], chars: [[40, 0, 0, 1], [40, 0, 0, 3]] });   // Chemist's weapon slot claims Gold's weapon
+  const expected = build((s) => { unlockCharacter(s, 'chemist'); grantGear(s, 40); equip(s, 'gold', 40, 0, 0); s.gear.tier.chemist = 3; });
+  const d = assertDecodes(t, code, expected, 'bonded slot');
+  if (d.ok) {
+    const lo = loadout(d.state);
+    t.eq(lo.characters.chemist.weapon, { bonded: true, key: 'chemistry-book' }, 'bonded weapon retained');
+    t.same(d.state.gear.tier.chemist, 3, 'tier still carried');
+    t.same(d.state.gear.equipped.chemist.weapon, null, 'slot cleared');
+    t.same(encode(d.state), assemble({ bits: [0, 6, 40], chars: [[40, 0, 0, 1], [0, 0, 0, 3]] }), 'bonded slot re-encodes as 0');
+  }
+});
+
+testCase(23, 'Two-byte index (registry ≥ 128)', (t) => {
+  const d = assertCanonical(t, FIXTURES.twoByte, 'two-byte varint in an unknown recruit slot');
+  if (d.ok) { t.eq(d.state.unknownRecruits, { 8: { slots: [130, 0, 0], tier: 1 } }, 'index 130 read from two bytes'); t.same(d.state.gear.tier.gold, 3, 'bytes after it read at the right offset'); }
+  // Hand-built: Gold's accessory slot carries a two-byte index to bit 130 (unknown item → cleared, bit kept).
+  const code = assemble({ bits: [0, 130], chars: [[0, 130, 0, 3]], endings: [0, 2] });
+  const expected = build((s) => { s.unknownBits = [130]; s.gear.tier.gold = 3; recordEnding(s, 'vol2', 2); });
+  assertDecodes(t, code, expected, 'two-byte index in a rostered slot');
+});
+
+testCase(24, 'Chip owned, Titanium has no drone kit', (t) => {
+  const d = assertCanonical(t, FIXTURES.chip, 'chip');
+  if (d.ok) {
+    const lo = loadout(d.state);
+    t.ok(d.state.gear.owned.includes(ID(32)), 'retained in collection');
+    t.same(d.state.gear.equipped.titanium.acc[0], ID(32), 'still equipped, not dropped');
+    t.same(lo.dormant.length, 1, 'exactly one dormant item');
+    t.ok(lo.dormant[0] && lo.dormant[0].id === ID(32) && /drone kit/.test(lo.dormant[0].reason), 'dormant with a plain-English reason');
+    t.eq(d.report.notes, [], 'never an error');
+  }
+});
+
+testCase(25, 'Both base and modified Gold item owned', (t) => {
+  const d = assertCanonical(t, FIXTURES.goldBoth, 'both owned');
+  if (d.ok) t.eq(d.state.gear.owned, [ID(35), ID(36)], 'both retained');
+  const code = assemble({ bits: [0, 35, 36], chars: [[0, 35, 36, 1]] });   // both worn at once
+  const expected = build((s) => { grantGear(s, 35); grantGear(s, 36); equip(s, 'gold', 0, 35, 0); });
+  assertDecodes(t, code, expected, 'one equippable at a time');
+});
+
+testCase(26, 'Tier byte out of range', (t) => {
+  const code = assemble({ bits: [0, 1], chars: [[0, 0, 0, 0], [0, 0, 0, 9]] });
+  const expected = build((s) => { unlockCharacter(s, 'silver'); s.gear.tier.gold = 1; s.gear.tier.silver = 3; });
+  const d = assertDecodes(t, code, expected, 'clamped');
+  if (d.ok) t.ok(d.report.notes.filter((n) => /tier was out of range/.test(n)).length === 2, 'both clamps noted');
+});
+
+testCase(27, 'Ending tier byte out of range', (t) => {
+  const code = assemble({ bits: [0], chars: [[0, 0, 0, 1]], endings: [7, 0, 200] });
+  const expected = build((s) => { recordEnding(s, 'vol1', 3); recordEnding(s, 'vol3', 3); });
+  assertDecodes(t, code, expected, 'clamped to 0–3');
+});
+
+testCase(28, 'Code says this game already cleared', (t) => {
+  const d = assertDecodes(t, FIXTURES.full.code, EXPECT.full(), 'cleared run loads');
+  if (d.ok) {
+    t.same(d.state.vols.vol2.tier, 3, 'already cleared at tier 3');
+    recordEnding(d.state, 'vol2', 1);
+    t.same(d.state.vols.vol2.tier, 3, 'replay with a worse ending never lowers the tier');
+    recordEnding(d.state, 'vol2', 0);
+    t.same(d.state.vols.vol2.tier, 3, 'never cleared');
+    recordEnding(d.state, 'vol1', 2);
+    t.same(d.state.vols.vol1.tier, 2, 'other games can still be raised');
+    t.ok(isPlayable(d.state), 'replay allowed: still playable');
+  }
+});
+
+testCase(29, 'Absurdly long code (≥ 512 chars)', (t) => {
+  useStorage(memoryStorage({}));
+  const current = EXPECT.mid();
+  const long = 'MTT2-' + 'A'.repeat(600);
+  const r = restore(long, current);
+  t.same(r.ok, false, 'rejected'); t.ok(/too long/.test(r.reason), 'rejected before decode: ' + r.reason);
+  const exactly = 'MTT2-' + 'A'.repeat(512 - 5);
+  t.ok(/too long/.test(decode(exactly).reason), '512 characters is rejected');
+  const under = 'MTT2-' + 'A'.repeat(511 - 5);
+  t.ok(!/too long/.test(decode(under).reason), '511 characters gets past the length check');
+});
+
+testCase(30, 'Cache and pasted code both present', (t) => {
+  const st = useStorage(memoryStorage({ 'mtt.crew': FIXTURES.mid.code }));
+  const cached = loadFromCache();
+  t.eq(cached.state, EXPECT.mid(), 'Continue gives exactly the cached run');
+  const pasted = restore(FIXTURES.full.code, cached.state);
+  t.eq(pasted.state, EXPECT.full(), 'Restore gives exactly the pasted run');
+  t.same(cached.state.crew.titanium.unlocked, false, 'cached run not merged with pasted');
+  t.same(pasted.state.gear.tier.gold, 3, 'pasted run not merged with cached');
+  t.same(st.dump()['mtt.crew'], FIXTURES.full.code, 'the chosen run is now cached');
+  t.same(st.dump()['mtt.crew.bak'], FIXTURES.mid.code, 'the previous run is in the backup');
+});
+
+testCase(31, 'Flags length byte claims more bytes than exist', (t) => {
+  const bad = corrupt(FIXTURES.mid.code, (body) => { body[0] = 200; });
+  const r = decode(bad);
+  t.same(r.ok, false, 'rejected'); t.ok(/checksum/.test(r.reason), 'checksum fails: ' + r.reason);
+  const resealed = reseal(FIXTURES.mid.code, (body) => { body[0] = 200; });
+  const r2 = decode(resealed);
+  t.same(r2.ok, false, 'even with a matching checksum it is rejected cleanly: ' + r2.reason);
+});
+
+testCase(32, 'Flags section is zero bytes long', (t) => {
+  const code = assemble({ bits: [], chars: [], endings: [] });   // hand-built minimal input; the encoder always writes Gold's bit
+  const d = assertDecodes(t, code, EXPECT.clean(), 'zero-length flags');
+  if (d.ok) t.same(d.state.crew.gold.unlocked, true, 'Gold only');
+});
+
+testCase(33, 'Endings section longer than games this build knows', (t) => {
+  const d = assertCanonical(t, FIXTURES.farEnding, 'far ending');
+  if (d.ok) {
+    t.eq(d.state.vols, { vol1: { tier: 0 }, vol2: { tier: 0 }, vol3: { tier: 0 }, vol4: { tier: 0 }, vol5: { tier: 0 }, vol6: { tier: 0 }, vol7: { tier: 2 } }, 'every Endings index kept, known game or not');
+    t.same(bytesOf(FIXTURES.farEnding.code)[bytesOf(FIXTURES.farEnding.code).length - 3 - 8], 7, 'Endings length byte is 7');
+  }
+});
+
+testCase(34, 'Round trip: decode a canonical code, re-encode', (t) => {
+  for (const name of Object.keys(FIXTURES)) assertCanonical(t, FIXTURES[name], name);
+  const full = FIXTURES.full.code;
+  t.ok(bytesOf(full).length <= 40 && full.length <= 60, 'complete run is about 39 bytes / 55 characters (' + bytesOf(full).length + ' bytes, ' + full.length + ' chars)');
+});
+
+testCase(35, 'Unknown recruit bit set', (t) => {
+  const d = assertCanonical(t, FIXTURES.unknownRecruit, 'unknown recruit');
+  if (d.ok) {
+    t.eq(d.state.unknownRecruits, { 9: { slots: [130, 5, 0], tier: 2 } }, 'slots and tier preserved');
+    t.eq(d.state.unknownBits, [], 'not double-counted as an unknown bit');
+    t.same(d.state.gear.equipped.silver.acc[0], ID(33), 'rostered character after it still correct');
+  }
+});
+
+testCase(36, 'Unknown recruit and three games cleared', (t) => {
+  const d = assertCanonical(t, FIXTURES.unknownRecruitThreeGames, 'unknown recruit + endings');
+  if (d.ok) {
+    t.eq(d.state.unknownRecruits, { 9: { slots: [130, 5, 0], tier: 2 } }, 'unknown recruit intact');
+    t.eq([d.state.vols.vol1.tier, d.state.vols.vol2.tier, d.state.vols.vol3.tier], [1, 2, 3], 'endings read at the right offset');
+    t.same(d.state.gear.tier.silver, 1, 'tier bytes not confused with endings');
+  }
+});
+
+testCase(37, 'Progress exists, crew cache missing', (t) => {
+  useStorage(memoryStorage({ 'mtt.vol2.progress': JSON.stringify({ zone: 3, code: FIXTURES.mid.code }) }));
+  const r = loadFromCache();
+  t.same(r.source, 'mtt.vol2.progress', 'continued from the embedded code');
+  t.eq(r.state, EXPECT.mid(), 'run restored');
+});
+
+testCase(38, 'Growth with unknowns: new gear after an unknown recruit, unknown bits and extension', (t) => {
+  const d = assertCanonical(t, FIXTURES.growthSeed, 'seed');
+  if (!d.ok) return;
+  const s = d.state;
+  unlockCharacter(s, 'titanium'); grantGear(s, 32); grantGear(s, 42); equip(s, 'titanium', 42, 32, 0); s.gear.tier.titanium = 2;   // titanium (bit 2) is inserted BEFORE the unknown recruit (bit 9)
+  const grown = encode(s);
+  t.ok(grown !== FIXTURES.growthSeed.code, 'code changed');
+  t.ok(grown.startsWith('MTT99-'), 'version kept');
+  const seedBytes = bytesOf(FIXTURES.growthSeed.code), grownBytes = bytesOf(grown);
+  t.same(grownBytes.length - seedBytes.length, 4, 'Equipped grew by 3 bytes and Tier by 1, in the middle of the payload');
+  const back = decode(grown);
+  t.ok(back.ok, 'grown code decodes (' + (back.ok ? 'ok' : back.reason) + ')');
+  if (back.ok) {
+    t.eq(back.state.unknownRecruits, { 9: { slots: [130, 5, 0], tier: 2 } }, 'unknown recruit intact at its new offset');
+    t.eq(back.state.unknownBits, [37, 300], 'unknown bits intact');
+    t.eq(back.state.extension, [0xfb, 0x01, 0x02], 'extension intact at its new offset');
+    t.eq(back.state.gear.owned, [ID(32), ID(33), ID(42)], 'new gear present');
+    t.eq(back.state.gear.equipped.titanium, { weapon: ID(42), acc: [ID(32), null] }, 'new equipment present');
+    t.eq(back.state, s, 'decoded result equals the grown state');
+    t.same(encode(back.state), grown, 'grown code round-trips byte-identical');
+  }
+});
+
+testCase(39, 'Growth with unknowns, then the game is cleared', (t) => {
+  const d = decode(FIXTURES.growthSeed.code);
+  t.ok(d.ok, 'seed decodes');
+  if (!d.ok) return;
+  const s = d.state;
+  unlockCharacter(s, 'titanium'); grantGear(s, 32); grantGear(s, 42); equip(s, 'titanium', 42, 32, 0);
+  recordEnding(s, 'vol2', 3);
+  const grown = encode(s);
+  const seedBytes = bytesOf(FIXTURES.growthSeed.code), grownBytes = bytesOf(grown);
+  t.same(grownBytes.length - seedBytes.length, 4 + 2, 'Equipped and Tier grew by 4 bytes, Endings by 2');
+  const back = decode(grown);
+  t.ok(back.ok, 'decodes (' + (back.ok ? 'ok' : back.reason) + ')');
+  if (back.ok) {
+    t.eq(back.state.vols.vol2, { tier: 3 }, 'game cleared');
+    t.eq(back.state.unknownRecruits, { 9: { slots: [130, 5, 0], tier: 2 } }, 'unknown recruit intact');
+    t.eq(back.state.unknownBits, [37, 300], 'unknown bits intact');
+    t.eq(back.state.extension, [0xfb, 0x01, 0x02], 'extension intact after the longer Endings');
+    t.eq(back.state, s, 'decoded result equals the grown state');
+    t.same(encode(back.state), grown, 'round-trips byte-identical');
+    t.same(back.state.s, 99, 'version kept');
+  }
+});
+
+/* ---- runner ------------------------------------------------------------------ */
+function runAllCases() {
+  const results = [];
+  for (const c of CASES) {
+    const t = makeT();
+    try { c.fn(t); } catch (e) { t.failures.push('threw: ' + (e && e.stack ? e.stack : e)); }
+    results.push({ n: c.n, name: c.name, pass: t.failures.length === 0, failures: t.failures });
+  }
+  Store.provider = () => window.localStorage; Session.reset();
+  return results;
+}
+</script>
+
+<script id="page">
+'use strict';
+/* Page routing: ?test=save runs the harness, ?decode=<code> explains a code.
+   Anything else shows a plain build note. No game UI lives on this branch. */
+(function () {
+  const app = document.getElementById('app');
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+  const params = new URLSearchParams(location.search);
+
+  function renderTests() {
+    const results = runAllCases();
+    const passed = results.filter((r) => r.pass).length;
+    app.replaceChildren();
+    app.append(el('h1', null, 'Binary Connection — save tests'));
+    app.append(el('div', 'summary ' + (passed === results.length ? 'pass' : 'fail'),
+      (passed === results.length ? 'PASS' : 'FAIL') + ' — ' + passed + ' of ' + results.length + ' cases passed'));
+    const ul = el('ul', 'cases');
+    for (const r of results) {
+      const li = el('li');
+      li.append(el('span', 'tag ' + (r.pass ? 'pass' : 'fail'), r.pass ? 'PASS' : 'FAIL'));
+      li.append(el('span', 'num', '#' + r.n));
+      li.append(document.createTextNode(r.name));
+      if (!r.pass) li.append(el('span', 'detail', r.failures.join('\n')));
+      ul.append(li);
+    }
+    app.append(ul);
+    document.title = (passed === results.length ? 'PASS' : 'FAIL') + ' ' + passed + '/' + results.length + ' — save tests';
+  }
+
+  function renderDecode(input) {
+    app.replaceChildren();
+    app.append(el('h1', null, COPY.menu));
+    const d = decode(input);
+    const box = el('div', 'lines');
+    if (!d.ok) {
+      app.append(el('div', 'summary fail', COPY.failure));
+      box.append(el('p', null, 'Why: ' + d.reason + '.'));
+      box.append(el('p', 'code', normalise(input)));
+    } else {
+      app.append(el('div', 'summary pass', COPY.success));
+      box.append(el('p', 'code', d.code));
+      for (const line of describeState(d.state, d.report)) {
+        const p = el('p'); p.append(el('span', 'k', line.k + ': ')); p.append(document.createTextNode(line.v)); box.append(p);
+      }
+    }
+    app.append(box);
+  }
+
+  function renderHome() {
+    app.replaceChildren();
+    app.append(el('h1', null, 'Metaling Through Time'));
+    app.append(el('p', null, 'Binary Connection — save engine build, schema version ' + SCHEMA_VERSION + '.'));
+    const p1 = el('p'); const a = el('a', null, 'Run the save tests'); a.href = '?test=save'; p1.append(a); app.append(p1);
+    app.append(el('p', 'muted', 'Add ?decode= followed by a code to read it in plain English.'));
+  }
+
+  try {
+    if (params.get('test') === 'save') renderTests();
+    else if (params.has('decode')) renderDecode(params.get('decode'));
+    else renderHome();
+  } catch (e) {
+    app.replaceChildren(el('p', null, 'Something went wrong on this page: ' + (e && e.message ? e.message : e)));
+  }
+})();
+</script>
+</body>
+</html>
