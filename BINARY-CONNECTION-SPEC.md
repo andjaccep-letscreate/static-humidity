@@ -243,7 +243,13 @@ MTT<version>-<base64url payload, no padding>
 | 3 | Tier | 1 byte per set character bit | Weapon tier 1–3 |
 | 4 | Endings | 1 length byte + N bytes | Byte *i* = ending tier of game *i+1*. 0 = not cleared, 1–3 = cleared at that tier. Trailing zeros trimmed |
 | 5 | Extension | everything remaining | Bytes appended by a newer schema version, preserved verbatim |
-| 6 | Checksum | 3 bytes | FNV-1a 32-bit over sections 1–5, truncated to the low 24 bits |
+| 6 | Checksum | 3 bytes | FNV-1a 32-bit over sections 1–5, truncated to the low 24 bits, written most-significant byte first |
+
+### Checksum byte order
+The 24-bit checksum is written **most-significant byte first** (big-endian):
+for a truncated value `0xbbbec9` the three bytes are `bb be c9`. FNV-1a uses
+offset basis `0x811c9dc5` and prime `0x01000193`. Every fixture in the corpus
+carries this order, so it is frozen with the corpus.
 
 ### Index encoding
 An Equipped index is **one byte if the registry index is below 128, two bytes
@@ -347,9 +353,12 @@ playable before anything is read.
 **Step 2 — Acquire.** Try `mtt.crew`, then `mtt.crew.bak`, both in try/catch.
 Throw or absent means no cache — proceed silently to a normal title screen.
 
-**Step 3 — Validate envelope.** Normalise first: trim whitespace, strip a
-repeated `MTT<digits>-` prefix. Then: prefix must be `MTT`, version must be
-digits, total length must be under **512 characters**, checksum must match.
+**Step 3 — Validate envelope.** Normalise first: trim leading and trailing
+whitespace (interior whitespace is **not** removed — a valid code never contains
+any, and a line-wrapped paste fails the checksum like any other corruption),
+then strip a repeated `MTT<digits>-` prefix. Then: prefix must be `MTT`, version
+must be digits, total length must be under **512 characters**, checksum must
+match.
 
 **Two different failure behaviours, deliberately:**
 - A **pasted** code that fails → "Connection incomplete", and the existing crew
@@ -480,7 +489,8 @@ The registry is frozen as of this document. Precisely:
 - The character bit set {0–3, 6–15}
 - Every row that has an assigned bit number
 - The bit number of any ID already written down
-- The section order, sizing rules, and index encoding in Section 5
+- The section order, sizing rules, index encoding, and checksum byte order in
+  Section 5
 - The rule that a newer version may only append sections after Endings
 
 **Not frozen — normal work:**
