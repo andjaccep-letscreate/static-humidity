@@ -436,7 +436,7 @@ function validateEnvelope(code) {
   if (dash < 0) return { ok: false, reason: 'no version separator' };
   const versionText = code.slice(SERIES_PREFIX.length, dash);
   if (!/^\d+$/.test(versionText)) return { ok: false, reason: 'version is not a number' };
-  if (!Number.isSafeInteger(Number(versionText))) return { ok: false, reason: 'version is too large' };
+  if (!Number.isSafeInteger(Number(versionText))) return { ok: false, reason: 'version is too large' };   // `s` is an int (Section 6); beyond 2^53 it could not be written back exactly
   if (code.length >= MAX_CODE_LENGTH) return { ok: false, reason: 'too long (' + code.length + ' characters)' };
   const payload = code.slice(dash + 1);
   const bytes = base64urlDecode(payload);
@@ -577,6 +577,10 @@ function decode(input) {
     if (t !== state.vols[vol].tier) report.notes.push('Ending tier for ' + titleOfGame(vol) + ' was out of range and was clamped to ' + t + '.');
     state.vols[vol].tier = t;
   }
+
+  // The rebuilt code must itself pass Step 3, or the cache would hold a code this build rejects on the next launch.
+  const rebuilt = encode(state);
+  if (rebuilt.length >= MAX_CODE_LENGTH) return { ok: false, reason: 'too long (' + rebuilt.length + ' characters after rebuild)' };
 
   return { ok: true, state, report, code };
 }
@@ -892,7 +896,11 @@ function testCase(n, name, fn) { CASES.push({ n, name, fn }); }
 function assertDecodes(t, code, expected, label) {
   const d = decode(code);
   t.ok(d.ok, label + ': decodes (' + (d.ok ? 'ok' : d.reason) + ')');
-  if (d.ok) { t.eq(d.state, expected, label + ': decoded state matches expected'); t.ok(isPlayable(d.state), label + ': playable'); }
+  if (d.ok) {
+    t.eq(d.state, expected, label + ': decoded state matches expected');
+    t.ok(isPlayable(d.state), label + ': playable');
+    t.ok(encode(d.state).length < MAX_CODE_LENGTH, label + ': rebuilt code stays under the length limit');
+  }
   return d;
 }
 function assertCanonical(t, fx, label) {
@@ -928,7 +936,8 @@ testCase('E2', 'Engine: base-128 varints are canonical and minimal', (t) => {
   t.same(varintRead([0x80], 0), null, 'truncated varint is rejected');
   t.same(varintRead([0xff, 0xff, 0xff, 0xff, 0x7f], 0), null, 'a fifth byte that overflows 32 bits is rejected');
   t.same(varintRead([0xff, 0xff, 0xff, 0xff, 0x0f], 0).value, 4294967295, 'the largest 32-bit value reads back exactly');
-  t.eq(varintRead([0x80, 0x00], 0), { value: 0, next: 2 }, 'an overlong encoding is accepted and canonicalised on the next write');
+  t.eq(varintRead([0x80, 0x00], 0), { value: 0, next: 2 }, 'an overlong encoding is accepted');
+  t.eq(varintEncode(varintRead([0xa8, 0x00], 0).value, []), [0x28], 'and is canonicalised on the next write');
 });
 
 testCase('E3', 'Engine: base64url is strict, unpadded, and round-trips', (t) => {
@@ -1257,6 +1266,12 @@ testCase(29, 'Absurdly long code (≥ 512 chars)', (t) => {
   t.ok(/too long/.test(decode(exactly).reason), '512 characters is rejected');
   const under = 'MTT2-' + 'A'.repeat(511 - 5);
   t.ok(!/too long/.test(decode(under).reason), '511 characters gets past the length check');
+  // A hand-made 511-character code with an empty Flags section grows by Gold's bit, slots and tier on rebuild: rejected now, not cached and lost later.
+  const grows = assemble({ bits: [], chars: [], endings: [], extension: new Array(374).fill(0xab) });
+  t.same(grows.length, 511, 'input is 511 characters');
+  const rg = restore(grows, current);
+  t.same(rg.ok, false, 'rejected'); t.ok(/after rebuild/.test(rg.reason), 'rejected because the rebuilt code would be too long (' + rg.reason + ')');
+  t.same(rg.message, COPY.failure, 'incomplete copy'); t.same(show(current), before, 'current crew untouched');
 });
 
 testCase(30, 'Cache and pasted code both present', (t) => {
