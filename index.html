@@ -291,11 +291,14 @@ function varintEncode(value, out) {   // canonical minimal unsigned base-128
   out.push(v);
   return out;
 }
-function varintRead(bytes, pos) {     // → { value, next } or null when truncated / overlong
+function varintRead(bytes, pos) {
+  // → { value, next }, or null when truncated, longer than 5 bytes, or above 32 bits.
+  // A non-minimal (overlong) encoding is accepted and canonicalised on the next write.
   let value = 0, shift = 0, i = pos;
   for (;;) {
     if (i >= bytes.length || shift > 28) return null;
     const b = bytes[i++];
+    if (shift === 28 && (b & 0x70) !== 0) return null;   // would not fit in 32 bits: never "exactly as read"
     value |= (b & 0x7f) << shift;
     if ((b & 0x80) === 0) break;
     shift += 7;
@@ -356,8 +359,8 @@ function collectBits(state) {
   for (const name of CHARACTERS) if (state.crew[name].unlocked) bits.add(ROSTER[name].bit);
   for (const id of state.gear.owned) { const b = REGISTRY_BIT.get(id); if (b !== undefined) bits.add(b); }
   for (const name of CHARACTERS) for (const id of state.crew[name].abilities) { const b = REGISTRY_BIT.get(id); if (b !== undefined) bits.add(b); }
-  for (const b of state.unknownBits) bits.add(b | 0);                       // original positions
-  for (const key of Object.keys(state.unknownRecruits)) bits.add(key | 0); // unknown recruits are set character bits
+  for (const b of state.unknownBits) if (!CHARACTER_BIT_SET.has(b | 0)) bits.add(b | 0);   // original positions; character bits live in unknownRecruits
+  for (const key of Object.keys(state.unknownRecruits)) bits.add(key | 0);                  // unknown recruits are set character bits
   return bits;
 }
 function slotIndex(id) { return id === null || id === undefined ? 0 : (REGISTRY_BIT.get(id) || 0); }
@@ -419,9 +422,8 @@ function encode(state) {
    Nothing here throws on bad input.
    -------------------------------------------------------------------------- */
 function normalise(raw) {
-  // Whitespace is removed (no valid code contains any). A repeated
-  // "MTT<digits>-" prefix, from pasting the code twice, collapses to one.
-  let s = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, '');
+  // Trim whitespace, then collapse a repeated "MTT<digits>-" prefix (the code pasted twice) to one.
+  let s = String(raw === null || raw === undefined ? '' : raw).trim();
   const m = /^MTT(\d+)-/.exec(s);
   if (m) { const p = m[0]; while (s.startsWith(p + p)) s = s.slice(p.length); }
   return s;
@@ -433,7 +435,8 @@ function validateEnvelope(code) {
   const dash = code.indexOf('-');                       // split on the FIRST dash only; base64url may contain dashes
   if (dash < 0) return { ok: false, reason: 'no version separator' };
   const versionText = code.slice(SERIES_PREFIX.length, dash);
-  if (!/^\d{1,9}$/.test(versionText)) return { ok: false, reason: 'version is not a number' };
+  if (!/^\d+$/.test(versionText)) return { ok: false, reason: 'version is not a number' };
+  if (!Number.isSafeInteger(Number(versionText))) return { ok: false, reason: 'version is too large' };
   if (code.length >= MAX_CODE_LENGTH) return { ok: false, reason: 'too long (' + code.length + ' characters)' };
   const payload = code.slice(dash + 1);
   const bytes = base64urlDecode(payload);
@@ -442,7 +445,7 @@ function validateEnvelope(code) {
   const body = bytes.slice(0, bytes.length - 3);
   const stored = (bytes[bytes.length - 3] << 16) | (bytes[bytes.length - 2] << 8) | bytes[bytes.length - 1];
   if (stored !== checksum24(body)) return { ok: false, reason: 'checksum does not match' };
-  return { ok: true, version: parseInt(versionText, 10), body };
+  return { ok: true, version: Number(versionText), body };
 }
 
 function readSections(body) {
@@ -474,11 +477,13 @@ function readSections(body) {
 /* Migration chain plumbing (Step 5). Keyed by the version being migrated FROM.
    None exists yet; the first real migration is a one-function change here. */
 const MIGRATIONS = Object.freeze({
-  // 1: (state, report) => { ... }   // schema 1 → 2
+  // 1: (state, raw, report) => { ... }   // schema 1 → 2
 });
-function migrate(state, fromVersion, report) {
+function migrate(state, raw, fromVersion, report) {
+  // Runs between Step 4 (decode) and Step 6 (resolve): a migration sees the facts and the
+  // still-unresolved slot indices (raw.chars) and may rewrite either before resolution.
   for (let v = fromVersion; v < SCHEMA_VERSION; v++) {
-    if (typeof MIGRATIONS[v] === 'function') MIGRATIONS[v](state, report);
+    if (typeof MIGRATIONS[v] === 'function') MIGRATIONS[v](state, raw, report);
     report.migrations.push(v + ' to ' + (v + 1));
   }
   state.s = SCHEMA_VERSION;
@@ -538,34 +543,40 @@ function decode(input) {
   }
   state.crew.gold.unlocked = true;                                       // Gold is always present
 
+  const raw = { chars: [] };                                             // rostered characters' slot indices, unresolved until Step 6
   for (const c of sec.chars) {                                           // Equipped + Tier, sized by set character bits
     const name = ROSTER_BY_BIT[c.bit];
     if (!name) { state.unknownRecruits[c.bit] = { slots: c.slots.slice(), tier: c.tier }; continue; }
-    const eq = state.gear.equipped[name];
-    eq.weapon = resolveSlot(state, name, 'weapon', c.slots[0], 'weapon slot', report);      // Step 6 — resolve defensively
-    eq.acc[0] = resolveSlot(state, name, 'accessory', c.slots[1], 'first accessory slot', report);
-    eq.acc[1] = resolveSlot(state, name, 'accessory', c.slots[2], 'second accessory slot', report);
-    if (eq.acc[1] !== null && sameFamily(eq.acc[0], eq.acc[1])) {
-      report.notes.push(titleOfCharacter(name) + ' had the same accessory, or its modified variant, in both slots; the second was cleared.');
-      eq.acc[1] = null;
-    }
-    const tier = clamp(c.tier, 1, 3);
-    if (tier !== c.tier) report.notes.push(titleOfCharacter(name) + "'s weapon tier was out of range and was clamped to " + tier + '.');
-    state.gear.tier[name] = tier;
+    raw.chars.push({ name, slots: c.slots.slice(), tier: c.tier });
   }
-
-  for (let i = 0; i < sec.endings.length; i++) {                         // every Endings index → vols, known game or not
-    const vol = 'vol' + (i + 1);
-    const tier = clamp(sec.endings[i], 0, 3);
-    if (tier !== sec.endings[i]) report.notes.push('Ending tier for ' + titleOfGame(vol) + ' was out of range and was clamped to ' + tier + '.');
-    state.vols[vol] = { tier };
-  }
+  for (let i = 0; i < sec.endings.length; i++) state.vols['vol' + (i + 1)] = { tier: sec.endings[i] };   // every index, known game or not
   state.extension = sec.extension.slice();
 
   // Step 5 — version handling.
-  if (env.version < SCHEMA_VERSION) migrate(state, env.version, report);   // lower: migration chain
-  else state.s = env.version;                                              // 2 loads directly; higher keeps its number (forward mode)
+  if (env.version < SCHEMA_VERSION) migrate(state, raw, env.version, report);   // lower: migration chain
+  else state.s = env.version;                                                   // 2 loads directly; higher keeps its number (forward mode)
   report.forward = env.version > SCHEMA_VERSION;
+
+  // Step 6 — resolve defensively. Nothing throws.
+  for (const c of raw.chars) {
+    const eq = state.gear.equipped[c.name];
+    eq.weapon = resolveSlot(state, c.name, 'weapon', c.slots[0], 'weapon slot', report);
+    eq.acc[0] = resolveSlot(state, c.name, 'accessory', c.slots[1], 'first accessory slot', report);
+    eq.acc[1] = resolveSlot(state, c.name, 'accessory', c.slots[2], 'second accessory slot', report);
+    if (eq.acc[1] !== null && sameFamily(eq.acc[0], eq.acc[1])) {
+      // Case 25: a base item and its modified variant are one item with one slot; the same is true of one item worn twice.
+      report.notes.push(titleOfCharacter(c.name) + ' had the same accessory, or its modified variant, in both slots; the second was cleared.');
+      eq.acc[1] = null;
+    }
+    const tier = clamp(c.tier, 1, 3);
+    if (tier !== c.tier) report.notes.push(titleOfCharacter(c.name) + "'s weapon tier was out of range and was clamped to " + tier + '.');
+    state.gear.tier[c.name] = tier;
+  }
+  for (const vol of Object.keys(state.vols)) {
+    const t = clamp(state.vols[vol].tier | 0, 0, 3);
+    if (t !== state.vols[vol].tier) report.notes.push('Ending tier for ' + titleOfGame(vol) + ' was out of range and was clamped to ' + t + '.');
+    state.vols[vol].tier = t;
+  }
 
   return { ok: true, state, report, code };
 }
@@ -847,6 +858,9 @@ const EXPECT = {
     s.s = 99; unlockCharacter(s, 'silver'); grantGear(s, 33); equip(s, 'silver', 0, 33, 0);
     s.unknownBits = [37, 300]; s.unknownRecruits[9] = { slots: [130, 5, 0], tier: 2 }; s.extension = [0xfb, 0x01, 0x02];
   }),
+  growthSeedLow: () => build((s) => {   // unknown bit below the first gear byte, unknown recruit, extension; no gear yet, so Flags itself will grow
+    s.s = 3; s.unknownBits = [20]; s.unknownRecruits[7] = { slots: [129, 0, 2], tier: 3 }; s.extension = [9];
+  }),
   goldBoth: () => build((s) => { grantGear(s, 35); grantGear(s, 36); equip(s, 'gold', 0, 36, 0); }),
   chip: () => build((s) => { unlockCharacter(s, 'titanium'); grantGear(s, 32); equip(s, 'titanium', 0, 32, 0); }),
   farEnding: () => build((s) => { recordEnding(s, 'vol7', 2); }),
@@ -868,6 +882,7 @@ const FIXTURES = {
   goldBoth:                 { code: 'MTT2-BQEAAAAYACQAAQCdvbw', expect: EXPECT.goldBoth },
   chip:                     { code: 'MTT2-BQUAAAABAAAAACAAAQEA9iu2', expect: EXPECT.chip },
   farEnding:                { code: 'MTT2-AQEAAAABBwAAAAAAAAIv4Fk', expect: EXPECT.farEnding },
+  growthSeedLow:            { code: 'MTT3-A4EAEAAAAIEBAAIBAwAJXuaI', expect: EXPECT.growthSeedLow },
 };
 
 /* ---- cases ------------------------------------------------------------------ */
@@ -884,7 +899,13 @@ function assertCanonical(t, fx, label) {
   const expected = fx.expect();
   t.same(encode(expected), fx.code, label + ': fixture is canonical (encode(expected) === code)');
   const d = assertDecodes(t, fx.code, expected, label);
-  if (d.ok) t.same(encode(d.state), fx.code, label + ': re-encode is byte-identical');
+  if (d.ok) {
+    const again = encode(d.state);
+    t.same(again, fx.code, label + ': re-encode is byte-identical');
+    const back = decode(again);
+    t.ok(back.ok, label + ': re-encoded code decodes');
+    if (back.ok) t.eq(back.state, expected, label + ': re-encoded code decodes to the same state');
+  }
   return d;
 }
 
@@ -905,6 +926,9 @@ testCase('E2', 'Engine: base-128 varints are canonical and minimal', (t) => {
   t.eq(varintEncode(16383, []), [0xff, 0x7f], '16383 is two bytes');
   for (const v of [0, 1, 127, 128, 255, 300, 16383, 16384]) t.eq(varintRead(varintEncode(v, []), 0).value, v, 'round trip ' + v);
   t.same(varintRead([0x80], 0), null, 'truncated varint is rejected');
+  t.same(varintRead([0xff, 0xff, 0xff, 0xff, 0x7f], 0), null, 'a fifth byte that overflows 32 bits is rejected');
+  t.same(varintRead([0xff, 0xff, 0xff, 0xff, 0x0f], 0).value, 4294967295, 'the largest 32-bit value reads back exactly');
+  t.eq(varintRead([0x80, 0x00], 0), { value: 0, next: 2 }, 'an overlong encoding is accepted and canonicalised on the next write');
 });
 
 testCase('E3', 'Engine: base64url is strict, unpadded, and round-trips', (t) => {
@@ -937,6 +961,8 @@ testCase('E4', 'Engine: registry integrity, frozen sets, display tables', (t) =>
   for (const v of ['vol1', 'vol2', 'vol3']) t.ok(typeof GAME_TITLES[v] === 'string' && !/vol\d/.test(GAME_TITLES[v]), 'public title for ' + v + ' carries no ordinal');
   t.eq(CHARACTERS, ['gold', 'silver', 'titanium', 'platinum', 'chemist'], 'roster in ascending bit order');
   t.ok(defaultState().crew.gold.unlocked === true, 'default state has Gold');
+  const stray = build((x) => { x.unknownBits = [9]; });
+  t.same(encode(stray), FIXTURES.clean.code, 'a character bit mistakenly placed in unknownBits is ignored by the encoder, never emitted without slots');
   t.ok(isPlayable(defaultState()), 'default state is playable');
 });
 
@@ -1036,23 +1062,31 @@ testCase(9, 'Pasted code, wrong prefix', (t) => {
 testCase(10, 'Pasted code truncated', (t) => {
   useStorage(memoryStorage({}));
   const current = EXPECT.mid(); const before = show(current);
-  for (const cut of [1, 4, 9, 20]) {
+  for (const cut of [4, 9, 20]) {
     const r = restore(FIXTURES.full.code.slice(0, -cut), current);
-    t.same(r.ok, false, 'truncated by ' + cut + ' rejected (' + r.reason + ')');
-    t.same(r.message, COPY.failure, 'incomplete copy');
+    t.same(r.ok, false, 'truncated by ' + cut + ' rejected');
+    t.ok(/checksum/.test(r.reason), 'checksum fails at cut ' + cut + ' (' + r.reason + ')');
+    t.same(r.message, COPY.failure, 'incomplete copy at cut ' + cut);
   }
+  const r1 = restore(FIXTURES.full.code.slice(0, -1), current);   // one character short leaves stray bits: rejected before the checksum
+  t.same(r1.ok, false, 'truncated by 1 rejected'); t.ok(/decodable/.test(r1.reason), 'not decodable (' + r1.reason + ')'); t.same(r1.message, COPY.failure, 'incomplete copy at cut 1');
   t.same(show(current), before, 'current crew untouched');
 });
 
 testCase(11, 'Pasted code, one character altered', (t) => {
   useStorage(memoryStorage({}));
-  const code = FIXTURES.full.code; const current = EXPECT.mid();
+  const code = FIXTURES.full.code; const current = EXPECT.mid(); const before = show(current);
   let checked = 0;
   for (let i = 5; i < code.length; i += 3) {
     const alt = code[i] === 'A' ? 'B' : 'A';
     const r = restore(code.slice(0, i) + alt + code.slice(i + 1), current);
-    t.same(r.ok, false, 'alteration at ' + i + ' rejected'); checked++;
+    t.same(r.ok, false, 'alteration at ' + i + ' rejected');
+    t.ok(/checksum|decodable/.test(r.reason), 'checksum fails at ' + i + ' (' + r.reason + ')');
+    t.same(r.message, COPY.failure, 'incomplete copy at ' + i);
+    t.same(r.state, current, 'current crew object untouched at ' + i);
+    checked++;
   }
+  t.same(show(current), before, 'current crew data untouched');
   t.ok(checked > 10, 'many positions checked');
 });
 
@@ -1215,8 +1249,10 @@ testCase(29, 'Absurdly long code (≥ 512 chars)', (t) => {
   useStorage(memoryStorage({}));
   const current = EXPECT.mid();
   const long = 'MTT2-' + 'A'.repeat(600);
+  const before = show(current);
   const r = restore(long, current);
   t.same(r.ok, false, 'rejected'); t.ok(/too long/.test(r.reason), 'rejected before decode: ' + r.reason);
+  t.same(r.message, COPY.failure, 'incomplete copy'); t.same(r.state, current, 'current crew object untouched'); t.same(show(current), before, 'current crew data untouched');
   const exactly = 'MTT2-' + 'A'.repeat(512 - 5);
   t.ok(/too long/.test(decode(exactly).reason), '512 characters is rejected');
   const under = 'MTT2-' + 'A'.repeat(511 - 5);
@@ -1309,6 +1345,25 @@ testCase(38, 'Growth with unknowns: new gear after an unknown recruit, unknown b
     t.eq(back.state.gear.equipped.titanium, { weapon: ID(42), acc: [ID(32), null] }, 'new equipment present');
     t.eq(back.state, s, 'decoded result equals the grown state');
     t.same(encode(back.state), grown, 'grown code round-trips byte-identical');
+  }
+  // Flags growth: this seed's unknown bit sits below the first gear byte, so finding gear lengthens Flags itself.
+  const low = assertCanonical(t, FIXTURES.growthSeedLow, 'low seed');
+  if (!low.ok) return;
+  const s2 = low.state;
+  t.same(bytesOf(FIXTURES.growthSeedLow.code)[0], 3, 'seed Flags is 3 bytes');
+  unlockCharacter(s2, 'silver'); grantGear(s2, 33); grantGear(s2, 40); equip(s2, 'gold', 40, 0, 0); equip(s2, 'silver', 0, 33, 0);
+  const grown2 = encode(s2);
+  t.same(bytesOf(grown2)[0], 6, 'Flags grew to 6 bytes');
+  t.same(bytesOf(grown2).length - bytesOf(FIXTURES.growthSeedLow.code).length, 3 + 3 + 1, 'Flags +3, Equipped +3, Tier +1');
+  const back2 = decode(grown2);
+  t.ok(back2.ok, 'grown code decodes (' + (back2.ok ? 'ok' : back2.reason) + ')');
+  if (back2.ok) {
+    t.eq(back2.state.unknownBits, [20], 'low unknown bit intact after Flags grew');
+    t.eq(back2.state.unknownRecruits, { 7: { slots: [129, 0, 2], tier: 3 } }, 'unknown recruit intact at its new offset');
+    t.eq(back2.state.extension, [9], 'extension intact at its new offset');
+    t.same(back2.state.s, 3, 'version kept');
+    t.eq(back2.state, s2, 'decoded result equals the grown state');
+    t.same(encode(back2.state), grown2, 'round-trips byte-identical');
   }
 });
 
